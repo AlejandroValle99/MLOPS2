@@ -1,0 +1,10 @@
+.venv
+.git
+.vscode
+__pycache__
+*.pyc
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.pre-commit-config.yaml
+README.md
