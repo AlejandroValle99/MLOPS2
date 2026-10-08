@@ -15,3 +15,16 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets — never commit the real .env, only .env.example
+.env
+.env.*
+!.env.example
+
+# MLflow local runs, derived data, TLS certs (Phase 3+), macOS cruft
+mlruns/
+data/snapshots/
+certs/
+.DS_Store
+
+/docs

@@ -3,20 +3,42 @@ name = "mlops-2"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = [
-    "fastapi>=0.141.1",
-    "uvicorn>=0.53.0",
-]
+requires-python = ">=3.12,<3.13"
+dependencies = []
 
 [dependency-groups]
+api = [
+    "boto3>=1.43.110",
+    "fastapi[standard]>=0.115.0",
+    "pydantic>=2.14.0",
+    "uvicorn[standard]>=0.29.0",
+]
 dev = [
     "mypy>=2.3.1",
     "pre-commit>=4.6.2",
+    "pytest>=9.1.1",
     "ruff>=0.16.8",
+]
+ml = [
+    "boto3>=1.43.110",
+    "mlflow>=2.15.0",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "scikit-learn>=1.5.0",
+    "xgboost>=3.2.0",
+]
+train = [
+    "matplotlib>=3.9.0",
+    "optuna>=4.3.0",
 ]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.12"
 ignore_missing_imports = true
 check_untyped_defs = true
+
+[tool.pytest.ini_options]
+# api/, model/, dags/, stroke/ are plain top-level packages with __init__.py — this just
+# makes sure the repo root itself is on sys.path so `import model.preprocess` etc. work
+# without installing the project.
+pythonpath = ["."]
