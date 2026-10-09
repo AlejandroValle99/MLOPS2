@@ -19,6 +19,11 @@ from utils.model_utils import BETA, METRIC_NAME, cv_f2
 from utils.s3_utils import get_s3_client, s3_file_exists, s3_to_dataframe
 
 from model.preprocess import build_feature_pipeline
+from stroke.data import data_version_for
+
+RAW_DATA_PATH = os.getenv(
+    "RAW_DATA_PATH", "/opt/airflow/data/raw/healthcare-dataset-stroke-data.csv"
+)
 
 # Clases custom del preprocessing/baseline que skops debe confiar al (de)serializar
 PREPROCESS_TRUSTED_TYPES = [
@@ -764,6 +769,17 @@ def process_etl_taskflow():
         client = mlflow.MlflowClient()
         mv = mlflow.register_model(winner_uri, SERVING_MODEL_NAME)
         client.set_registered_model_alias(SERVING_MODEL_NAME, "champion", mv.version)
+
+        # D5 (docs/PLAN.md): tag model_family and data_version on the version that
+        # actually serves the API. `threshold` is deliberately not tagged here — it
+        # depends on Phase 5's calibration + out-of-fold threshold selection, which
+        # this comparison DAG doesn't do yet (it still picks a winner at the default
+        # 0.5 cutoff, baked into METRIC_NAME's F2 computation upstream).
+        client.set_model_version_tag(SERVING_MODEL_NAME, mv.version, "model_family", champion_name)
+        version = data_version_for(RAW_DATA_PATH)
+        if version is not None:
+            client.set_model_version_tag(SERVING_MODEL_NAME, mv.version, "data_version", version)
+
         logging.info(
             f"'{SERVING_MODEL_NAME}' v{mv.version} promovido a alias 'champion' "
             f"(algoritmo ganador: {champion_name})"

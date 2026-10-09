@@ -17,6 +17,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
 from model.preprocess import build_feature_pipeline, load_data
+from stroke.data import data_version_for
 
 DATA_PATH = os.getenv("DATA_PATH", "data/healthcare-dataset-stroke-data.csv")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
@@ -133,6 +134,20 @@ def train() -> None:
         if versions:
             new_version = versions[0].version
             client.set_registered_model_alias(REGISTERED_MODEL_NAME, CHAMPION_ALIAS, new_version)
+
+            # D5 (docs/PLAN.md): tag model_family and data_version on every version, so a
+            # version can always be traced to the algorithm and the exact data that made
+            # it. `threshold` is NOT tagged here on purpose — it depends on Phase 5's
+            # calibration + out-of-fold threshold selection, which doesn't exist yet.
+            client.set_model_version_tag(
+                REGISTERED_MODEL_NAME, new_version, "model_family", "random_forest"
+            )
+            version = data_version_for(DATA_PATH)
+            if version is not None:
+                client.set_model_version_tag(
+                    REGISTERED_MODEL_NAME, new_version, "data_version", version
+                )
+
             print(
                 f"Modelo '{REGISTERED_MODEL_NAME}' v{new_version} "
                 f"promovido a alias '{CHAMPION_ALIAS}'"
