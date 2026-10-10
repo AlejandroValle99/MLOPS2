@@ -5,6 +5,7 @@ import os
 import mlflow
 import mlflow.sklearn
 import pandas as pd
+from mlflow.exceptions import MlflowException
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     average_precision_score,
@@ -163,5 +164,17 @@ def train() -> None:
     print(f"\nExperimento '{EXPERIMENT_NAME}' → {MLFLOW_TRACKING_URI}")
 
 
+def _champion_exists() -> bool:
+    try:
+        mlflow.MlflowClient().get_model_version_by_alias(REGISTERED_MODEL_NAME, CHAMPION_ALIAS)
+        return True
+    except MlflowException:
+        return False
+
+
 if __name__ == "__main__":
-    train()
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    if _champion_exists():
+        print(f"'{REGISTERED_MODEL_NAME}@{CHAMPION_ALIAS}' already exists; skipping bootstrap")
+    else:
+        train()
