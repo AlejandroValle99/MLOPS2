@@ -12,6 +12,7 @@ COPY pyproject.toml uv.lock ./
 # champion promoted by the comparison DAG could never load in the API.
 RUN uv sync --frozen --no-dev --group api --group ml --group train
 ENV PATH="/app/.venv/bin:$PATH"
+ENV GIT_PYTHON_REFRESH=quiet
 
 COPY api/ ./api/
 COPY model/ ./model/
