@@ -23,6 +23,7 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./model:/opt/airflow/model
+    - ./stroke:/opt/airflow/stroke
     - ./data:/opt/airflow/data
     - airflow-logs:/opt/airflow/logs
   depends_on:
@@ -202,8 +203,8 @@ services:
       MODEL_ALIAS: ${MODEL_ALIAS}
       DATASET_BUCKET: datasets
       DATASET_KEY: healthcare-dataset-stroke-data.csv
-      MUTATION_SAMPLE_RATE: "0.80"
-      MUTATION_NOISE_STD: "0.03"
+      MUTATION_SAMPLE_RATE: ${MUTATION_SAMPLE_RATE}
+      MUTATION_NOISE_STD: ${MUTATION_NOISE_STD}
     ports:
       - "8000:8000"
     depends_on:

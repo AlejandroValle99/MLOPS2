@@ -115,12 +115,13 @@ def train() -> None:
         mlflow.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
         mlflow.sklearn.log_model(
             pipeline,
-            "stroke-model",
+            name="stroke-model",
             input_example=X_train.head(1),
             registered_model_name=REGISTERED_MODEL_NAME,
             skops_trusted_types=[
                 "model.preprocess.BMIGroupImputer",
                 "model.preprocess.StrokeCleaner",
+                "sklearn.tree._tree.Tree",
             ],
         )
 
