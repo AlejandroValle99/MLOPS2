@@ -40,7 +40,6 @@ BUCKET = "mlflow-artifacts"
 default_args = {
     "owner": "mlops-fiuba",
     "depends_on_past": False,
-    "schedule_interval": None,
     "retries": 1,
     "retry_delay": datetime.timedelta(minutes=5),
     "dagrun_timeout": datetime.timedelta(minutes=15),
@@ -52,6 +51,8 @@ default_args = {
     description="ETL para preparar datos de entrenamiento usando TaskFlow API",
     default_args=default_args,
     catchup=False,
+    schedule=None,
+    start_date=datetime.datetime(2025, 1, 1),
     tags=["ETL", "TaskFlow"],
 )
 def process_etl_taskflow():

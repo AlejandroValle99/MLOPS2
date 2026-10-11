@@ -15,7 +15,9 @@ CSV = Path(__file__).parent.parent / "data/raw/healthcare-dataset-stroke-data.cs
 
 @pytest.fixture(scope="module")
 def manifest():
-    return write_manifest(CSV)
+    """The committed manifest, checked against the CSV. Never write_manifest() here: that
+    would rewrite data/raw/ on every run and re-fingerprint a corrupted file as the reference."""
+    return verify_manifest(CSV)
 
 
 def test_the_restored_dataset_is_the_original_not_the_corrupted_head(manifest):
