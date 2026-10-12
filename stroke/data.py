@@ -2,10 +2,10 @@
 
 The raw CSV is immutable. `write_manifest` records its fingerprint once, when the file is
 first stored; `verify_manifest` is meant to be called before any pipeline run, so a raw
-file that changed underneath you fails loudly instead of silently shrinking the dataset —
-this is the manifest for the exact bug that corrupted the MLOps 1 dataset (see
-Appendix C / Phase 0 of docs/PLAN.md): `dags/stroke_pipeline.py`'s `fetch_data` used to
-write a mutated snapshot over this same raw file.
+file that changed underneath you fails loudly instead of silently shrinking the dataset.
+That happened once: `dags/stroke_pipeline.py`'s `fetch_data` used to write a mutated
+snapshot over this same raw file, and the dataset shrank from 5,110 to 2,093 rows over
+four runs before anyone noticed.
 """
 
 import hashlib

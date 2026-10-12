@@ -21,7 +21,7 @@ wheels/
 .env.*
 !.env.example
 
-# MLflow local runs, derived data, TLS certs (Phase 3+), macOS cruft
+# MLflow local runs, derived data, TLS certs, macOS cruft
 mlruns/
 data/snapshots/
 certs/

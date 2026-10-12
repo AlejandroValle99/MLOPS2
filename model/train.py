@@ -137,10 +137,10 @@ def train() -> None:
             new_version = versions[0].version
             client.set_registered_model_alias(REGISTERED_MODEL_NAME, CHAMPION_ALIAS, new_version)
 
-            # D5 (docs/PLAN.md): tag model_family and data_version on every version, so a
-            # version can always be traced to the algorithm and the exact data that made
-            # it. `threshold` is NOT tagged here on purpose — it depends on Phase 5's
-            # calibration + out-of-fold threshold selection, which doesn't exist yet.
+            # Tag model_family and data_version on every version, so a version can always be
+            # traced to the algorithm and the exact data that made it. `threshold` is not
+            # tagged: this script predicts at the default 0.5 cutoff and has no calibrated,
+            # selected threshold to record yet.
             client.set_model_version_tag(
                 REGISTERED_MODEL_NAME, new_version, "model_family", "random_forest"
             )

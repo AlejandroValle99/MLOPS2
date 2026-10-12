@@ -7,17 +7,14 @@ inference, federated learning and a data lake added as the course progresses.
 This builds on the author's own group project for MLOps I
 (predicting stroke risk on the [Stroke Prediction Dataset](https://www.kaggle.com/datasets/fedesoriano/stroke-prediction-dataset)),
 which supplies the Airflow + MLflow + MinIO + PostgreSQL base and the original
-FastAPI service. See [`docs/PLAN.md`](docs/PLAN.md) for the full plan (goals, decisions,
-phase-by-phase tasks) and [`docs/PRIMERS.md`](docs/PRIMERS.md) for primers on the
-technologies new to this course (GraphQL, gRPC, streaming, federated learning, data
-lakes, JWT/TLS).
+FastAPI service.
 
-**Status:** Phase 0 done — the MLOps I codebase has been moved in and its known bugs
-fixed (see `docs/PLAN.md`, Phase 0 and Appendix C). Phases 1 onward (REST polish,
-GraphQL, gRPC, streaming, training rigor, federated learning, data lake, security) are
-in progress.
+**Status:** the MLOps I base runs here with its known bugs fixed (among them, a DAG that
+overwrote the raw dataset, now guarded by a checksum manifest), and the REST API is
+complete (Mini-TP 1, below). GraphQL, gRPC, streaming, more rigorous training, federated
+learning, the data lake and security are in progress.
 
-## Architecture (base, growing with each phase)
+## Architecture (the base; it grows as layers are added)
 
 ```
                         Docker Compose
@@ -41,13 +38,14 @@ in progress.
 
 | Dir | Role |
 |---|---|
-| `api/` | FastAPI service: REST (and, from Phase 2, GraphQL) |
+| `api/` | FastAPI service: REST today, GraphQL next |
 | `model/` | Feature pipeline and training |
 | `dags/` | Airflow DAGs: data prep, model comparison, production retrain |
 | `docker/` | Per-service Dockerfiles (Airflow, MLflow, Postgres init) |
-| `stroke/` | New lifecycle modules added for MLOps II (data manifest/guard today; evaluation, registry, drift, federated learning as phases land) |
+| `stroke/` | Lifecycle modules added for MLOps II: the raw-data manifest and the frozen split today; evaluation, registry, drift and federated learning as they are built |
 | `data/raw/` | The immutable source dataset + its integrity manifest |
-| `docs/` | `PLAN.md` (the project plan) and `PRIMERS.md` (technology primers) |
+| `scripts/` | Command-line clients and utilities (`mini_tp1_client.py`) |
+| `tests/` | pytest suite, one file per module under test; shared fixtures in `conftest.py` |
 
 ## Setup
 
@@ -69,17 +67,57 @@ docker compose up -d
 | MLflow | http://localhost:5001 |
 | MinIO Console | http://localhost:9001 |
 
-## Run the API locally (without Docker)
+## REST API (Mini-TP 1)
+
+The API serves the version of `stroke-model` that holds the `champion` alias in the
+MLflow registry.
+
+| Route | Purpose | API key |
+|---|---|---|
+| `POST /v1/predict` | One prediction | required |
+| `GET /v1/model` | The served model: name, version, threshold, family, data version | required |
+| `GET /health` | Liveness: 200 while the process is up | — |
+| `GET /ready` | Readiness: 200 and the model version once a model is loaded, 503 before | — |
+
+**Contract.** The request (`api/schemas.py`) holds the model's ten real features, with
+range checks (for example `0 < age <= 120`). Unknown fields and out-of-range values are
+rejected with a 422 that names the field. `bmi` may be omitted (the model imputes it), and
+`patient_id` is optional and never used as a feature. The response carries the
+probability, `high_risk` (probability at or above the model's threshold), the threshold,
+and the model name and version.
+
+**API keys.** The API accepts any of the comma-separated values in `API_KEYS`, sent in
+the `X-API-KEY` header. Set `API_KEYS` in your env file.
+
+**Client.** One valid call (200), one invalid call (422), and one call with a wrong key
+(401), with each status and body printed:
 
 ```bash
+API_KEY=<one of API_KEYS> uv run --group api python scripts/mini_tp1_client.py
+```
+
+## Run the API locally (without Docker)
+
+The rest of the stack must be up for the API to load the champion model. Stop the
+compose `api` service first, because it also uses port 8000:
+
+```bash
+docker compose stop api
+API_KEYS=dev-key \
+MLFLOW_TRACKING_URI=http://localhost:5001 \
+MLFLOW_S3_ENDPOINT_URL=http://localhost:9000 \
+AWS_ACCESS_KEY_ID=<MINIO_ROOT_USER> AWS_SECRET_ACCESS_KEY=<MINIO_ROOT_PASSWORD> \
 uv run --group api --group ml uvicorn api.main:app --reload
 ```
 
 ## Tests
 
 ```bash
-uv run --group ml --group dev pytest
+uv run --group api --group ml --group dev pytest
 ```
+
+No running services are needed: the API tests train a small model in memory and swap it
+in for the MLflow one.
 
 ## Lint, format, type check
 
@@ -90,6 +128,9 @@ uv run mypy model stroke api
 ```
 
 ## Pre-commit hooks
+
+Once per clone. Every commit then runs ruff (lint and format), mypy and the test suite,
+using the same tool versions as `uv.lock`:
 
 ```bash
 uv run pre-commit install
