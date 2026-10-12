@@ -13,8 +13,20 @@ CSV = Path(__file__).parent.parent / "data/raw/healthcare-dataset-stroke-data.cs
 
 
 @pytest.fixture(scope="session")
-def split():
-    X, y = load_clean(CSV)
+def raw_csv() -> Path:
+    """The immutable source dataset. Tests may read it, never write it."""
+    return CSV
+
+
+@pytest.fixture(scope="session")
+def dataset():
+    """(X, y) after load_clean. Shared by every test, so treat it as read-only."""
+    return load_clean(CSV)
+
+
+@pytest.fixture(scope="session")
+def split(dataset):
+    X, y = dataset
     return split_train_test(X, y)  # X_train, X_test, y_train, y_test
 
 

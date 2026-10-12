@@ -7,17 +7,14 @@ inference, federated learning and a data lake added as the course progresses.
 This builds on the author's own group project for MLOps I
 (predicting stroke risk on the [Stroke Prediction Dataset](https://www.kaggle.com/datasets/fedesoriano/stroke-prediction-dataset)),
 which supplies the Airflow + MLflow + MinIO + PostgreSQL base and the original
-FastAPI service. See [`docs/PLAN.md`](docs/PLAN.md) for the full plan (goals, decisions,
-phase-by-phase tasks) and [`docs/PRIMERS.md`](docs/PRIMERS.md) for primers on the
-technologies new to this course (GraphQL, gRPC, streaming, federated learning, data
-lakes, JWT/TLS).
+FastAPI service.
 
-**Status:** Phases 0 and 1 done. The MLOps I codebase was moved in and its known bugs
-fixed (see `docs/PLAN.md`, Phase 0 and Appendix C), and the REST API was rebuilt for
-Mini-TP 1 (below). Phases 2 onward (GraphQL, gRPC, streaming, training rigor, federated
-learning, data lake, security) are in progress.
+**Status:** the MLOps I base runs here with its known bugs fixed (among them, a DAG that
+overwrote the raw dataset, now guarded by a checksum manifest), and the REST API is
+complete (Mini-TP 1, below). GraphQL, gRPC, streaming, more rigorous training, federated
+learning, the data lake and security are in progress.
 
-## Architecture (base, growing with each phase)
+## Architecture (the base; it grows as layers are added)
 
 ```
                         Docker Compose
@@ -41,13 +38,14 @@ learning, data lake, security) are in progress.
 
 | Dir | Role |
 |---|---|
-| `api/` | FastAPI service: REST (and, from Phase 2, GraphQL) |
+| `api/` | FastAPI service: REST today, GraphQL next |
 | `model/` | Feature pipeline and training |
 | `dags/` | Airflow DAGs: data prep, model comparison, production retrain |
 | `docker/` | Per-service Dockerfiles (Airflow, MLflow, Postgres init) |
-| `stroke/` | New lifecycle modules added for MLOps II (data manifest/guard today; evaluation, registry, drift, federated learning as phases land) |
+| `stroke/` | Lifecycle modules added for MLOps II: the raw-data manifest and the frozen split today; evaluation, registry, drift and federated learning as they are built |
 | `data/raw/` | The immutable source dataset + its integrity manifest |
-| `docs/` | `PLAN.md` (the project plan) and `PRIMERS.md` (technology primers) |
+| `scripts/` | Command-line clients and utilities (`mini_tp1_client.py`) |
+| `tests/` | pytest suite, one file per module under test; shared fixtures in `conftest.py` |
 
 ## Setup
 

@@ -1,4 +1,4 @@
-"""D3 (docs/PLAN.md): docker/airflow/requirements.txt pins the libraries that matter for
+"""docker/airflow/requirements.txt pins the libraries that matter for
 pickle compatibility (the model is pickled in the Airflow image, unpickled in the serving
 image) to the exact versions uv.lock resolved. This test fails the moment those drift —
 cheaper than finding out via a broken mlflow.sklearn.load_model in a container.

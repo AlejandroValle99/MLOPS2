@@ -39,13 +39,12 @@ _BIN_COLS = [
 _WORK_COL = ["work_type"]
 _SMOKE_COL = ["smoking_status"]
 
-# Fixed, exhaustive category lists for the one-hot columns. Bug fixed here (MLOps 1 ->
-# MLOps 2 move, Phase 0): the OneHotEncoder used to infer categories from whatever was
-# in the training split, so a split missing a category produced fewer output columns
-# (11 instead of 14) than a split that had every category. Pinning categories= makes
-# every fit produce the same 14-column output regardless of what the training data
-# happens to contain — a prerequisite for federated learning, where each client's local
-# split is small and may not include every category.
+# Fixed, exhaustive category lists for the one-hot columns. Inferring the categories from
+# the training data instead would make a split that lacks a category produce fewer output
+# columns (11 instead of 14). Pinning categories= makes every fit produce the same
+# 14-column output regardless of what the training data happens to contain, which
+# federated learning needs: each client's local split is small and may not include every
+# category.
 WORK_TYPES = ["Private", "Self-employed", "Govt_job", "children", "Never_worked"]
 # "Unknown" smoking status is remapped to "never smoked" by StrokeCleaner before this
 # encoder ever sees the column, so "Unknown" is deliberately not listed here.

@@ -1,5 +1,5 @@
-"""Phase 1 (docs/PLAN.md): the REST contract, routes, API key, liveness vs readiness, and
-parity with the offline model. No MLflow needed: the predictor is swapped for one holding
+"""The REST API: the request contract, routes, API key, liveness vs readiness, and parity
+with the offline model. No MLflow needed: the predictor is swapped for one holding
 the `tiny_model` fixture (tests/conftest.py) through FastAPI's dependency_overrides.
 """
 

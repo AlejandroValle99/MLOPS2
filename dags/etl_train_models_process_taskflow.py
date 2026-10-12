@@ -771,11 +771,10 @@ def process_etl_taskflow():
         mv = mlflow.register_model(winner_uri, SERVING_MODEL_NAME)
         client.set_registered_model_alias(SERVING_MODEL_NAME, "champion", mv.version)
 
-        # D5 (docs/PLAN.md): tag model_family and data_version on the version that
-        # actually serves the API. `threshold` is deliberately not tagged here — it
-        # depends on Phase 5's calibration + out-of-fold threshold selection, which
-        # this comparison DAG doesn't do yet (it still picks a winner at the default
-        # 0.5 cutoff, baked into METRIC_NAME's F2 computation upstream).
+        # Tag model_family and data_version on the version that actually serves the API.
+        # `threshold` is not tagged: this DAG picks the winner at the default 0.5 cutoff
+        # (baked into METRIC_NAME's F2 computation upstream), so there is no calibrated,
+        # selected threshold to record yet.
         client.set_model_version_tag(SERVING_MODEL_NAME, mv.version, "model_family", champion_name)
         version = data_version_for(RAW_DATA_PATH)
         if version is not None:

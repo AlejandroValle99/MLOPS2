@@ -9,12 +9,12 @@ from airflow.operators.python import PythonOperator
 
 DATA_SERVICE_URL = os.getenv("DATA_SERVICE_URL", "http://api:8000")
 
-# Fixed bug (MLOps 1 -> MLOps 2 move, Phase 0): fetch_data used to write the mutated
-# /dataset response over this same path, which is the bind-mounted RAW source file.
-# minio-init re-uploaded that mutated copy on every restart, so the dataset shrank
-# 5,110 -> 4,088 -> 3,270 -> 2,616 -> 2,093 rows across four runs before anyone noticed.
-# RAW_DATA_PATH is read-only here, never written to. fetch_data writes to SNAPSHOT_PATH
-# instead, and validate_data/train_model read the snapshot, not the raw file.
+# fetch_data used to write the mutated /dataset response over this same path, which is
+# the bind-mounted RAW source file. minio-init re-uploaded that mutated copy on every
+# restart, so the dataset shrank 5,110 -> 4,088 -> 3,270 -> 2,616 -> 2,093 rows across
+# four runs before anyone noticed. RAW_DATA_PATH is read-only here, never written to:
+# fetch_data writes to SNAPSHOT_PATH instead, and validate_data/train_model read the
+# snapshot, not the raw file.
 RAW_DATA_PATH = os.getenv(
     "RAW_DATA_PATH", "/opt/airflow/data/raw/healthcare-dataset-stroke-data.csv"
 )
