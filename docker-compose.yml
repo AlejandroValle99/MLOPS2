@@ -205,6 +205,7 @@ services:
       DATASET_KEY: healthcare-dataset-stroke-data.csv
       MUTATION_SAMPLE_RATE: ${MUTATION_SAMPLE_RATE}
       MUTATION_NOISE_STD: ${MUTATION_NOISE_STD}
+      API_KEYS: ${API_KEYS}
     ports:
       - "8000:8000"
     depends_on:

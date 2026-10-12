@@ -10,6 +10,7 @@ select = [
     "UP",  # pyupgrade
     "B",   # flake8-bugbear
 ]
+unfixable = ["F401"]  # flag unused imports, but never auto-delete them
 
 [format]
 quote-style = "double"
