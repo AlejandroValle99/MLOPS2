@@ -1,13 +1,33 @@
+# Every hook runs the tool from the project's own environment (uv.lock), so a commit checks
+# exactly what `uv run ruff`, `uv run mypy` and `uv run pytest` check by hand: same
+# versions, same installed libraries. Install once with: uv run pre-commit install
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.8
+  - repo: local
     hooks:
       - id: ruff-check
-        args: [--fix]
-      - id: ruff-format
+        name: ruff check --fix
+        entry: uv run ruff check --fix --force-exclude
+        language: system
+        types_or: [python, pyi]
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v2.3.1
-    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+
+      # Fixed targets, not the staged files: the same command as CLAUDE.md and the README.
       - id: mypy
-        additional_dependencies: [fastapi, uvicorn]
+        name: mypy (model, stroke, api)
+        entry: uv run --group api --group ml mypy model stroke api
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      # The suite needs no services and runs in about a second; only on Python changes.
+      - id: pytest
+        name: pytest
+        entry: uv run --group api --group ml --group dev pytest -q
+        language: system
+        types: [python]
+        pass_filenames: false
