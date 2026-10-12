@@ -106,6 +106,7 @@ def predict(
         threshold=scored.info.threshold,
         model_name=scored.info.name,
         model_version=scored.info.version,
+        model_family=scored.info.family,
     )
 
 

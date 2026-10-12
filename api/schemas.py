@@ -35,3 +35,4 @@ class StrokePrediction(BaseModel):
     threshold: float
     model_name: str
     model_version: str
+    model_family: str | None
