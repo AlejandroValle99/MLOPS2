@@ -8,6 +8,10 @@ aplica dentro del propio modelo (Pipeline de sklearn). Acá solo se particiona e
 dataset crudo y se persisten los splits en MinIO para que el DAG de comparación
 los consuma.
 
+Nota: el entrenamiento ya no lee estos CSV. etl_train_models_process_taskflow reconstruye
+el split congelado (80/20, stroke.data.split_train_test) desde el CSV crudo verificado, y el
+orquestador ya no dispara este DAG.
+
 Tareas
 ------
 1. validate_source — verifica que el CSV de entrada existe y tiene el esquema esperado

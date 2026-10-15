@@ -1,180 +1,303 @@
-"""Train the stroke prediction Random Forest and log the run to MLflow."""
+"""Train the stroke-risk candidates, pick a finalist, and send it through the promotion gate.
 
+    python -m model.train [--trials N] [--candidates logreg,xgboost] [--skip-if-champion]
+
+For each candidate family, on the training split only:
+
+1. Tune: Optuna (TPE sampler, median pruner) maximizes the mean 5-fold CV PR-AUC. PR-AUC
+   doesn't depend on a threshold, so it is a steadier target than F2 with ~200 positives.
+2. Calibrate: sigmoid calibration on out-of-fold predictions. Class weights push the
+   scores up on purpose; after calibration a 0.2 means about a 20% chance.
+3. Choose the threshold: the cut that maximizes F2 on out-of-fold calibrated probabilities,
+   so every training row is scored by a model that never saw it.
+4. Log: the run, its hyperparameters, out-of-fold and test metrics, and the model.
+
+The candidate with the best out-of-fold F2 is the finalist. It becomes a new version of the
+served model and goes through the gate (stroke.registry.run_gate), which promotes it only
+with statistical evidence that it beats the champion. The test split picks nothing: not
+the hyperparameters, not the threshold, not the finalist. It is scored once per candidate
+for the record, and the gate reads it.
+"""
+
+import argparse
+import json
+import logging
 import os
+from pathlib import Path
+from typing import Any
 
-import mlflow
-import mlflow.sklearn
+import numpy as np
+import optuna
 import pandas as pd
-from mlflow.exceptions import MlflowException
+from mlflow.tracking import MlflowClient
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (
-    average_precision_score,
-    fbeta_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
-from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-from model.preprocess import build_feature_pipeline, load_data
-from stroke.data import data_version_for
+from model.preprocess import build_feature_pipeline
+from stroke.config import (
+    CANDIDATES,
+    CV_FOLDS,
+    GATE_MIN_P_BETTER,
+    MODEL_NAME,
+    RANDOM_SEED,
+)
+from stroke.data import TrainingData, assign_hospital, frozen_data
+from stroke.drift import reference_document
+from stroke.evaluation import PRIMARY, best_threshold, metrics_at
+from stroke.registry import get_alias, log_candidate, register, run_gate, use_experiment
 
-DATA_PATH = os.getenv("DATA_PATH", "data/healthcare-dataset-stroke-data.csv")
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-EXPERIMENT_NAME = "stroke-prediction"
-REGISTERED_MODEL_NAME = "stroke-model"
-CHAMPION_ALIAS = "champion"
+log = logging.getLogger(__name__)
 
-BETA = 2
-
-RF_PARAMS: dict = {
-    "n_estimators": 100,
-    "max_depth": 10,
-    "min_samples_leaf": 19,
-    "max_features": "log2",
-    "class_weight": "balanced",
-    "random_state": 42,
-    "n_jobs": -1,
-}
-
-VAL_RATIO = 0.20
-TEST_RATIO = 0.20
+DATA_PATH = os.getenv("DATA_PATH", "data/raw/healthcare-dataset-stroke-data.csv")
 
 
-def _get_or_create_experiment(name: str) -> str:
-    experiment = mlflow.get_experiment_by_name(name)
-    if experiment is None:
-        return str(
-            mlflow.create_experiment(
-                name=name,
-                tags={"project": "stroke-prediction", "team": "mlops-fiuba"},
-            )
+def search_space(name: str, trial: optuna.Trial) -> dict:
+    """The hyperparameters Optuna tunes for each family. age_only has none."""
+    if name == "logreg":
+        return {"C": trial.suggest_float("C", 1e-3, 10.0, log=True)}
+    if name == "random_forest":
+        # Shallow-ish trees with large leaves: with ~200 positives, deep trees memorize them,
+        # and they also make the artifact large and every prediction slow.
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 300, step=100),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 10, 50),
+            "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2"]),
+        }
+    if name == "xgboost":
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 400, step=100),
+            "max_depth": trial.suggest_int("max_depth", 2, 6),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+        }
+    return {}
+
+
+def fixed_params(name: str, y: pd.Series) -> dict:
+    """Hyperparameters set from the data rather than tuned (logged alongside the tuned ones)."""
+    if name == "xgboost":
+        # XGBoost's form of class weights: each positive counts as much as neg/pos negatives.
+        return {"scale_pos_weight": float((y == 0).sum() / (y == 1).sum())}
+    return {}
+
+
+def make_candidate(name: str, params: dict) -> Pipeline:
+    """An unfitted pipeline, raw DataFrame in, probability out. Built only from scikit-learn,
+    xgboost and model.preprocess classes, because those are what the serving images have."""
+    if name == "age_only":
+        # The floor: a logistic regression on age alone.
+        return Pipeline(
+            [
+                ("preprocess", ColumnTransformer([("age", StandardScaler(), ["age"])])),
+                ("model", LogisticRegression(**params)),
+            ]
         )
-    return str(experiment.experiment_id)
+    model: Any
+    if name == "logreg":
+        model = LogisticRegression(max_iter=1000, class_weight="balanced", **params)
+    elif name == "random_forest":
+        model = RandomForestClassifier(
+            class_weight="balanced", random_state=RANDOM_SEED, n_jobs=-1, **params
+        )
+    elif name == "xgboost":
+        from xgboost import XGBClassifier  # imported here: on macOS it needs libomp to load
+
+        model = XGBClassifier(eval_metric="aucpr", random_state=RANDOM_SEED, n_jobs=-1, **params)
+    else:
+        raise ValueError(f"unknown candidate {name!r}; expected one of {CANDIDATES}")
+    return Pipeline([("preprocess", build_feature_pipeline()), ("model", model)])
 
 
-def _evaluate(model: Pipeline, X: pd.DataFrame, y: pd.Series) -> dict[str, float]:
-    y_pred = model.predict(X)
-    y_prob = model.predict_proba(X)[:, 1]
-    return {
-        f"f{BETA}": fbeta_score(y, y_pred, beta=BETA),
-        "recall": recall_score(y, y_pred),
-        "precision": precision_score(y, y_pred, zero_division=0),
-        "roc_auc": roc_auc_score(y, y_prob),
-        "pr_auc": average_precision_score(y, y_prob),
+def tune(
+    name: str, X: pd.DataFrame, y: pd.Series, n_trials: int, seed: int = RANDOM_SEED
+) -> tuple[dict, dict[str, float]]:
+    """(best hyperparameters, tuning metrics) by mean CV PR-AUC on the training rows."""
+    fixed = fixed_params(name, y)
+    if name == "age_only":  # nothing to tune
+        return fixed, {}
+    folds = list(StratifiedKFold(CV_FOLDS, shuffle=True, random_state=seed).split(X, y))
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {**search_space(name, trial), **fixed}
+        scores: list[float] = []
+        for step, (fit_rows, val_rows) in enumerate(folds):
+            model = make_candidate(name, params).fit(X.iloc[fit_rows], y.iloc[fit_rows])
+            proba = model.predict_proba(X.iloc[val_rows])[:, 1]
+            scores.append(average_precision_score(y.iloc[val_rows], proba))
+            trial.report(float(np.mean(scores)), step)
+            if trial.should_prune():  # well below earlier trials after the same folds
+                raise optuna.TrialPruned()
+        return float(np.mean(scores))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
+    )
+    study.optimize(objective, n_trials=n_trials)
+    pruned = sum(t.state == optuna.trial.TrialState.PRUNED for t in study.trials)
+    return {**study.best_params, **fixed}, {
+        "cv_pr_auc": study.best_value,
+        "tuning_trials": float(len(study.trials)),
+        "tuning_pruned": float(pruned),
     }
 
 
-def train() -> None:
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    experiment_id = _get_or_create_experiment(EXPERIMENT_NAME)
+def calibrate(
+    name: str, params: dict, X: pd.DataFrame, y: pd.Series, seed: int = RANDOM_SEED
+) -> tuple[CalibratedClassifierCV, np.ndarray, float]:
+    """(calibrated model fitted on all rows, out-of-fold calibrated probabilities, threshold).
 
-    X, y = load_data(DATA_PATH)
+    Sigmoid, not isotonic: isotonic overfits with this few positives. ensemble=False keeps
+    one fitted pipeline plus its calibrator instead of five copies: a fifth of the size and
+    of the time per prediction, with no measurable loss here.
 
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X,
-        y,
-        test_size=VAL_RATIO + TEST_RATIO,
-        stratify=y,
-        random_state=42,
+    The out-of-fold probabilities come from 5 x 5 fits: each outer fold calibrates on its
+    own training rows only, then scores rows it never saw. The threshold is chosen on those.
+    """
+    calibrated = CalibratedClassifierCV(
+        make_candidate(name, params), method="sigmoid", cv=CV_FOLDS, ensemble=False
     )
-    X_test, X_val, y_test, y_val = train_test_split(
-        X_temp,
-        y_temp,
-        test_size=0.5,
-        stratify=y_temp,
-        random_state=42,
+    folds = StratifiedKFold(CV_FOLDS, shuffle=True, random_state=seed)
+    oof = cross_val_predict(calibrated, X, y, cv=folds, method="predict_proba")[:, 1]
+    threshold, _ = best_threshold(y.to_numpy(), oof)
+    return calibrated.fit(X, y), oof, threshold
+
+
+def single_threaded(model: CalibratedClassifierCV) -> CalibratedClassifierCV:
+    """The fitted model set to predict on one thread. Training uses every core, but the
+    model server scores one patient (or a few hundred) per call, where starting a thread
+    pool costs more than it saves: a 100-tree forest took 16.7 ms per row with n_jobs=-1
+    and 4.8 ms with n_jobs=1. The probabilities stay the same, up to float rounding."""
+    for calibrated in model.calibrated_classifiers_:
+        estimator = calibrated.estimator.named_steps["model"]
+        if "n_jobs" in estimator.get_params():
+            estimator.set_params(n_jobs=1)
+    return model
+
+
+def train_candidate(
+    name: str,
+    data: TrainingData,
+    n_trials: int,
+    pipeline: str,
+) -> dict:
+    """Tune, calibrate, threshold, score and log one candidate. Returns a small summary
+    (it travels through XCom), including what register() needs if it is the finalist."""
+    log.info("training %s on %d rows", name, len(data.X_train))
+    params, tuning = tune(name, data.X_train, data.y_train, n_trials)
+    model, oof, threshold = calibrate(name, params, data.X_train, data.y_train)
+    oof_metrics = metrics_at(data.y_train, oof, threshold)
+    # The only time this candidate sees the test set: scored once, for the record.
+    test_metrics = metrics_at(data.y_test, model.predict_proba(data.X_test)[:, 1], threshold)
+
+    use_experiment()
+    run_id, model_uri = log_candidate(
+        name,
+        single_threaded(model),
+        params,
+        metrics={
+            **{f"oof_{k}": v for k, v in oof_metrics.items()},
+            **{f"test_{k}": v for k, v in test_metrics.items()},
+            **tuning,
+        },
+        tags={
+            "pipeline": pipeline,
+            "data_version": data.data_version,
+            "test_split": data.test_split,
+        },
+        reference_stats=reference_document(
+            data.X_train, assign_hospital(data.X_train), data.data_version
+        ),
+        input_example=data.X_train.head(1),
     )
+    summary = {
+        "model_family": name,
+        "run_id": run_id,
+        "model_uri": model_uri,
+        "threshold": threshold,
+        "data_version": data.data_version,
+        "test_split": data.test_split,
+        f"oof_{PRIMARY}": oof_metrics[PRIMARY],
+        f"test_{PRIMARY}": test_metrics[PRIMARY],
+    }
+    log.info("%s: %s", name, json.dumps(summary))
+    return summary
 
-    pipeline = Pipeline(
-        [
-            ("preprocess", build_feature_pipeline()),
-            ("model", RandomForestClassifier(**RF_PARAMS)),
-        ]
+
+def select_finalist(summaries: list[dict]) -> dict:
+    """The candidate with the best out-of-fold F2: training-only evidence picks it."""
+    return max(summaries, key=lambda s: s[f"oof_{PRIMARY}"])
+
+
+def register_and_gate(
+    summaries: list[dict],
+    data: TrainingData,
+    min_p_better: float = GATE_MIN_P_BETTER,
+    name: str = MODEL_NAME,
+) -> dict:
+    """Register the finalist as a new version, then let the gate decide on it."""
+    finalist = select_finalist(summaries)
+    version = register(name, finalist)
+    log.info("finalist %s registered as %s v%s", finalist["model_family"], name, version)
+    result = run_gate(MlflowClient(), name, version, data.X_test, data.y_test, min_p_better)
+    return {**result, "model_family": finalist["model_family"]}
+
+
+def train_and_gate(
+    data: TrainingData,
+    n_trials: int,
+    pipeline: str,
+    candidates: tuple[str, ...] = CANDIDATES,
+    min_p_better: float = GATE_MIN_P_BETTER,
+    name: str = MODEL_NAME,
+) -> dict:
+    """Every candidate, one after the other, then the gate. The comparison DAG does the
+    same in parallel tasks; this is for model-init and the retrain DAG."""
+    summaries = [train_candidate(family, data, n_trials, pipeline) for family in candidates]
+    return register_and_gate(summaries, data, min_p_better, name)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Train the candidates, pick a finalist, and send it through the gate."
     )
-    pipeline.fit(X_train, y_train)
+    parser.add_argument("--data", default=DATA_PATH, help="the raw CSV (with its manifest)")
+    parser.add_argument("--trials", type=int, default=30, help="Optuna trials per candidate")
+    parser.add_argument("--candidates", default=",".join(CANDIDATES))
+    parser.add_argument("--min-p-better", type=float, default=GATE_MIN_P_BETTER)
+    parser.add_argument(
+        "--skip-if-champion",
+        action="store_true",
+        help="exit without training when a champion already exists (the compose bootstrap)",
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    val_metrics = _evaluate(pipeline, X_val, y_val)
-    test_metrics = _evaluate(pipeline, X_test, y_test)
-
-    with mlflow.start_run(
-        experiment_id=experiment_id,
-        run_name="random_forest_training",
-        tags={"model": "random_forest"},
-    ):
-        mlflow.log_params(RF_PARAMS)
-        mlflow.log_params(
-            {
-                "val_ratio": VAL_RATIO,
-                "test_ratio": TEST_RATIO,
-                "train_samples": len(X_train),
-                "beta": BETA,
-            }
-        )
-        mlflow.log_metrics({f"val_{k}": v for k, v in val_metrics.items()})
-        mlflow.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
-        mlflow.sklearn.log_model(
-            pipeline,
-            name="stroke-model",
-            input_example=X_train.head(1),
-            registered_model_name=REGISTERED_MODEL_NAME,
-            skops_trusted_types=[
-                "model.preprocess.BMIGroupImputer",
-                "model.preprocess.StrokeCleaner",
-                "sklearn.tree._tree.Tree",
-            ],
-        )
-
-        # Promote the latest version to the champion alias
-        client = mlflow.MlflowClient()
-        versions = client.search_model_versions(
-            f"name='{REGISTERED_MODEL_NAME}'",
-            max_results=1,
-            order_by=["version_number DESC"],
-        )
-        if versions:
-            new_version = versions[0].version
-            client.set_registered_model_alias(REGISTERED_MODEL_NAME, CHAMPION_ALIAS, new_version)
-
-            # Tag model_family and data_version on every version, so a version can always be
-            # traced to the algorithm and the exact data that made it. `threshold` is not
-            # tagged: this script predicts at the default 0.5 cutoff and has no calibrated,
-            # selected threshold to record yet.
-            client.set_model_version_tag(
-                REGISTERED_MODEL_NAME, new_version, "model_family", "random_forest"
-            )
-            version = data_version_for(DATA_PATH)
-            if version is not None:
-                client.set_model_version_tag(
-                    REGISTERED_MODEL_NAME, new_version, "data_version", version
-                )
-
-            print(
-                f"Modelo '{REGISTERED_MODEL_NAME}' v{new_version} "
-                f"promovido a alias '{CHAMPION_ALIAS}'"
-            )
-
-    print("=== Validación ===")
-    for k, v in val_metrics.items():
-        print(f"  {k}: {v:.4f}")
-    print("=== Test ===")
-    for k, v in test_metrics.items():
-        print(f"  {k}: {v:.4f}")
-    print(f"\nExperimento '{EXPERIMENT_NAME}' → {MLFLOW_TRACKING_URI}")
-
-
-def _champion_exists() -> bool:
-    try:
-        mlflow.MlflowClient().get_model_version_by_alias(REGISTERED_MODEL_NAME, CHAMPION_ALIAS)
-        return True
-    except MlflowException:
-        return False
+    # MLflow reads MLFLOW_TRACKING_URI from the environment.
+    name = MODEL_NAME
+    if args.skip_if_champion and get_alias(MlflowClient(), name) is not None:
+        log.info("%s already has a champion; nothing to bootstrap", name)
+        return
+    result = train_and_gate(
+        frozen_data(Path(args.data)),
+        n_trials=args.trials,
+        pipeline="train.py",
+        candidates=tuple(args.candidates.split(",")),
+        min_p_better=args.min_p_better,
+        name=name,
+    )
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    if _champion_exists():
-        print(f"'{REGISTERED_MODEL_NAME}@{CHAMPION_ALIAS}' already exists; skipping bootstrap")
-    else:
-        train()
+    main()

@@ -84,3 +84,25 @@ def build_hospital_references(X: pd.DataFrame, hospitals: pd.Series) -> dict[str
     design (age is part of the rule), so one baseline for everyone would flag age "drift"
     at every hospital forever."""
     return {str(h): build_reference(X[hospitals == h]) for h in sorted(hospitals.unique())}
+
+
+def _rounded(value: object) -> object:
+    """Six decimals everywhere, so the file is stable across platforms and diffs cleanly."""
+    if isinstance(value, float):
+        return round(value, 6)
+    if isinstance(value, dict):
+        return {k: _rounded(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_rounded(v) for v in value]
+    return value
+
+
+def reference_document(X_train: pd.DataFrame, hospitals: pd.Series, data_version: str) -> dict:
+    """The reference_stats.json document: one baseline per hospital from the training rows.
+    The stream worker reads the committed copy; every training run logs its own as well."""
+    return {
+        "source": "frozen training split, one baseline per hospital",
+        "data_version": data_version,
+        "monitored": MONITORED,
+        "hospitals": _rounded(build_hospital_references(X_train, hospitals)),
+    }
