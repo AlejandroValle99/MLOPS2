@@ -190,8 +190,8 @@ services:
     restart: "no"
 
   # ── gRPC model server ───────────────────────────────────────────────────────
-  # Holds the champion model and hot-reloads it when the alias moves. The API (and later
-  # the stream worker) score through it, so there is one model in memory for every client.
+  # Holds the champion model and hot-reloads it when the alias moves. The API and the
+  # stream worker score through it, so there is one model in memory for every client.
   model-server:
     build:
       context: .
@@ -219,7 +219,7 @@ services:
       mlflow:
         condition: service_healthy
       model-init:
-        condition: service_completed_successfully  # a champion exists before we start
+        condition: service_completed_successfully # a champion exists before we start
     restart: unless-stopped
 
   # ── FastAPI serving ─────────────────────────────────────────────────────────
@@ -251,8 +251,81 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  redpanda:
+    image: redpandadata/redpanda:v26.2.3
+    profiles: ["streaming"]
+    # Two listeners: containers reach the broker as redpanda:9092, the laptop (the event
+    # producer, the hospital inbox) as localhost:19092. A Kafka client reconnects to the
+    # address the broker advertises, so each side must be told its own.
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container
+      - --smp 1
+      - --memory 1G
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # Creates the topics, or leaves them if they exist, then sets the one-hour retention on
+  # the two that hold patient features. The retention is set even on existing topics:
+  # dev-container mode auto-creates a topic on first use, with the default retention.
+  redpanda-init:
+    image: redpandadata/redpanda:v26.2.3
+    profiles: ["streaming"]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        create() {
+          rpk topic create "$$1" -p 1 -r 1 -X brokers=redpanda:9092 "$${@:2}" \
+            || rpk topic describe "$$1" -X brokers=redpanda:9092 > /dev/null
+        }
+        create patient-events
+        create patient-events-dlq
+        create predictions
+        create drift-alerts
+        rpk topic alter-config patient-events patient-events-dlq \
+          --set retention.ms=3600000 -X brokers=redpanda:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+
+  stream-worker:
+    build:
+      context: .
+      dockerfile: services/stream_worker/Dockerfile
+    profiles: ["streaming"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      MODEL_SERVER_TARGET: model-server:50051
+      RPC_TIMEOUT_S: "${RPC_TIMEOUT_S:-2}"
+      WINDOW_EVENTS: "${WINDOW_EVENTS:-300}"
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      model-server:
+        condition: service_healthy
+    restart: unless-stopped
+
 # ─── volumes ──────────────────────────────────────────────────────────────────
 volumes:
   postgres-data:
   minio-data:
   airflow-logs:
+  redpanda-data:
