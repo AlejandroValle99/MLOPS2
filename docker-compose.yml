@@ -19,6 +19,10 @@ x-airflow-common: &airflow-common
     # runtime to point at the fetched snapshot instead — see that DAG's comments.
     DATA_PATH: /opt/airflow/data/raw/healthcare-dataset-stroke-data.csv
     DATA_SERVICE_URL: http://api:8000
+    # Training registers versions under the same name the model server follows, and the
+    # gate's default bar (each DAG run can override it in "Trigger DAG w/ config").
+    MODEL_NAME: ${MODEL_NAME}
+    GATE_MIN_P_BETTER: "${GATE_MIN_P_BETTER:-0.90}"
     PYTHONPATH: /opt/airflow:/opt/airflow/dags
   volumes:
     - ./dags:/opt/airflow/dags
@@ -171,6 +175,9 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  # The first champion: trains every candidate (few trials, so the first start stays short)
+  # and sends the finalist through the same gate as the DAGs. Exits at once if a champion
+  # already exists. Reads the raw file and its manifest from a read-only mount.
   model-init:
     build:
       context: .
@@ -180,8 +187,11 @@ services:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
-      DATA_PATH: s3://datasets/healthcare-dataset-stroke-data.csv
-    command: python -m model.train
+      MODEL_NAME: ${MODEL_NAME}
+      DATA_PATH: /app/data/raw/healthcare-dataset-stroke-data.csv
+    volumes:
+      - ./data/raw:/app/data/raw:ro
+    command: python -m model.train --skip-if-champion --trials 10
     depends_on:
       mlflow:
         condition: service_healthy
