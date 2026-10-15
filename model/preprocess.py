@@ -153,11 +153,15 @@ def _read_csv(csv_path: str) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(obj["Body"].read()))
 
 
-def load_data(csv_path: str) -> tuple[pd.DataFrame, pd.Series]:
-    """Loads raw CSV, drops id and gender='Other' rows, returns (X, y)."""
-    df = _read_csv(csv_path)
+def split_features_target(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Drops id and gender='Other' rows from a raw-format frame, returns (X, y)."""
     df = df.drop(columns=["id"])
     df = df[df["gender"] != "Other"]
     X = df.drop(columns=[TARGET])
     y = df[TARGET].astype(int)
     return X, y
+
+
+def load_data(csv_path: str) -> tuple[pd.DataFrame, pd.Series]:
+    """Loads raw CSV, drops id and gender='Other' rows, returns (X, y)."""
+    return split_features_target(_read_csv(csv_path))
