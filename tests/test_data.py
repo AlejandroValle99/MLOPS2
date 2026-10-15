@@ -4,7 +4,14 @@ import pandas as pd
 import pytest
 
 from model.preprocess import RAW_COLUMNS
-from stroke.data import data_version, split_train_test, verify_manifest, write_manifest
+from stroke.data import (
+    HOSPITALS,
+    assign_hospital,
+    data_version,
+    split_train_test,
+    verify_manifest,
+    write_manifest,
+)
 
 
 @pytest.fixture(scope="module")
@@ -53,3 +60,21 @@ def test_split_is_deterministic_and_keeps_the_positive_ratio(dataset):
     assert X_tr1.index.equals(X_tr2.index)  # same seed -> same rows
     assert len(X_tr1) == 4087 and int(y_tr1.sum()) == 199
     assert len(X_te1) == 1022 and int(y_te1.sum()) == 50
+
+
+def test_every_patient_belongs_to_exactly_one_of_the_four_hospitals(dataset):
+    X, _ = dataset
+    hospitals = assign_hospital(X)
+    assert hospitals.index.equals(X.index)
+    assert set(hospitals.unique()) == set(HOSPITALS)
+    assert hospitals.value_counts().to_dict() == {
+        "urban-under60": 1889,
+        "rural-under60": 1844,
+        "urban-60plus": 707,
+        "rural-60plus": 669,
+    }
+
+
+def test_the_hospital_rule_reads_residence_and_age_60_and_over():
+    X = pd.DataFrame({"Residence_type": ["Urban", "Rural", "Rural"], "age": [60.0, 59.9, 82.0]})
+    assert assign_hospital(X).tolist() == ["urban-60plus", "rural-under60", "rural-60plus"]

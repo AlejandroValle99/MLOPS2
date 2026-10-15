@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
@@ -119,3 +120,15 @@ def split_train_test(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     """One stratified split, frozen by seed. The test rows are never used for tuning."""
     return train_test_split(X, y, test_size=test_size, stratify=y, random_state=seed)
+
+
+# The hospitals the service's simulated customers are: residence type x age 60 and over.
+HOSPITALS = ("urban-60plus", "urban-under60", "rural-60plus", "rural-under60")
+
+
+def assign_hospital(X: pd.DataFrame) -> pd.Series:
+    """Which hospital each patient belongs to, from two raw features. The dataset has no
+    hospital column, so this rule stands in for one. It is deterministic, so the event
+    producer and the drift baselines always agree on who belongs where."""
+    band = np.where(X["age"] >= 60, "-60plus", "-under60")
+    return (X["Residence_type"].str.lower() + band).rename("hospital_id")
