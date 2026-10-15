@@ -7,8 +7,9 @@ import grpc
 import pandas as pd
 import pytest
 
+from api.schemas import StrokeInput
 from model.preprocess import RAW_COLUMNS
-from services.model_server.servicer import CHUNK
+from services.model_server.servicer import BOUNDS, CHUNK
 from stroke_rpc.convert import request_from_record
 from stroke_rpc.v1 import scoring_pb2 as pb
 
@@ -182,3 +183,11 @@ def test_model_info_leaves_unknown_optional_fields_unset(model_server, stub, mak
     info = stub.GetModelInfo(pb.ModelInfoRequest(), timeout=2)
     assert not info.HasField("family")
     assert not info.HasField("data_version")
+
+
+def test_the_server_checks_the_same_bounds_as_the_rest_contract():
+    """Both channels accept and refuse the same patients. The stream worker relies on it: it
+    validates with the REST contract, so a row it passes must not be refused here."""
+    for field, (low, high) in BOUNDS.items():
+        limits = {type(m).__name__: m for m in StrokeInput.model_fields[field].metadata}
+        assert (limits["Gt"].gt, limits["Le"].le) == (low, high), field
