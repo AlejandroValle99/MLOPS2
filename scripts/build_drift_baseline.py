@@ -12,33 +12,18 @@ import json
 from pathlib import Path
 
 from stroke.data import assign_hospital, data_version, load_clean, split_train_test, verify_manifest
-from stroke.drift import MONITORED, build_hospital_references
+from stroke.drift import reference_document
 
 ROOT = Path(__file__).resolve().parent.parent
 RAW_CSV = ROOT / "data/raw/healthcare-dataset-stroke-data.csv"
 OUT = ROOT / "data/drift/reference_stats.json"
 
 
-def _rounded(value: object) -> object:
-    """Six decimals everywhere, so the file is stable across platforms and diffs cleanly."""
-    if isinstance(value, float):
-        return round(value, 6)
-    if isinstance(value, dict):
-        return {k: _rounded(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_rounded(v) for v in value]
-    return value
-
-
 def build() -> dict:
     X, y = load_clean(RAW_CSV)
     X_train, _, _, _ = split_train_test(X, y)
-    return {
-        "source": "frozen training split, one baseline per hospital",
-        "data_version": data_version(verify_manifest(RAW_CSV)),
-        "monitored": MONITORED,
-        "hospitals": _rounded(build_hospital_references(X_train, assign_hospital(X_train))),
-    }
+    version = data_version(verify_manifest(RAW_CSV))
+    return reference_document(X_train, assign_hospital(X_train), version)
 
 
 def main() -> None:
