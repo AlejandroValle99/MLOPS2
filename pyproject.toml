@@ -37,6 +37,14 @@ serve = [
     "grpcio-reflection>=1.84.0",
     "protobuf>=7.36.2",
 ]
+stream = [
+    "grpcio>=1.84.0",
+    "kafka-python>=3.0.11",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "protobuf>=7.36.2",
+    "pydantic>=2.14.0",
+]
 train = [
     "matplotlib>=3.9.0",
     "optuna>=4.3.0",

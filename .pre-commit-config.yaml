@@ -19,7 +19,7 @@ repos:
       # Fixed targets, not the staged files: the same command as CLAUDE.md and the README.
       - id: mypy
         name: mypy (model, stroke, api, services, stroke_rpc)
-        entry: uv run --group api --group ml --group serve mypy model stroke api services stroke_rpc
+        entry: uv run --group api --group ml --group serve --group stream mypy model stroke api services stroke_rpc
         language: system
         types: [python]
         pass_filenames: false
@@ -27,7 +27,7 @@ repos:
       # The suite needs no services and runs in about a second; only on Python changes.
       - id: pytest
         name: pytest
-        entry: uv run --group api --group ml --group serve --group dev pytest -q
+        entry: uv run --group api --group ml --group serve --group stream --group dev pytest -q
         language: system
         types: [python]
         pass_filenames: false
