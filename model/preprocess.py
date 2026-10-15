@@ -13,8 +13,8 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 TARGET = "stroke"
 
-# Public so other modules (stroke_rpc.convert, stroke.federated, tests) can import the
-# exact raw feature names instead of hand-copying them.
+# Public so other modules (stroke_rpc.convert, tests) can import the exact raw feature
+# names instead of hand-copying them.
 RAW_COLUMNS = [
     "gender",
     "age",
@@ -42,9 +42,8 @@ _SMOKE_COL = ["smoking_status"]
 # Fixed, exhaustive category lists for the one-hot columns. Inferring the categories from
 # the training data instead would make a split that lacks a category produce fewer output
 # columns (11 instead of 14). Pinning categories= makes every fit produce the same
-# 14-column output regardless of what the training data happens to contain, which
-# federated learning needs: each client's local split is small and may not include every
-# category.
+# 14-column output regardless of what the training data happens to contain, so a model
+# fitted on a small slice of the data still accepts every valid input.
 WORK_TYPES = ["Private", "Self-employed", "Govt_job", "children", "Never_worked"]
 # "Unknown" smoking status is remapped to "never smoked" by StrokeCleaner before this
 # encoder ever sees the column, so "Unknown" is deliberately not listed here.

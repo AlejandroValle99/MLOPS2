@@ -13,9 +13,8 @@ def test_feature_pipeline_outputs_14_columns_and_no_missing_values(dataset):
 
 
 def test_feature_width_is_stable_when_the_training_data_lacks_categories(dataset):
-    """The one-hot categories are pinned, so a pipeline fitted on a subset that is missing
-    some categories (a small slice of the data, such as one federated client's) still
-    outputs 14 columns instead of fewer."""
+    """The one-hot categories are pinned, so a pipeline fitted on a small slice of the data
+    that is missing some categories still outputs 14 columns instead of fewer."""
     X, _ = dataset
     subset = X[X.work_type.isin(["Private", "children"])]
     pipe = build_feature_pipeline().fit(subset)
