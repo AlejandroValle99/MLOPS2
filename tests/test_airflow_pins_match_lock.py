@@ -17,6 +17,7 @@ PINNED_LIBS = [
     "scikit-learn",
     "xgboost",
     "mlflow",
+    "skops",  # MLflow saves scikit-learn models in skops format: writer and reader must match
     "numpy",
     "pandas",
     "boto3",

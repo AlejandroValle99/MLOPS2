@@ -1,10 +1,11 @@
-# Las librerías de serialización (scikit-learn, xgboost, mlflow, numpy, pandas) se pinean
+# Las librerías de serialización (scikit-learn, xgboost, mlflow, skops, numpy, pandas) se pinean
 # EXACTO a las versiones resueltas en uv.lock (grupo ml/train de la raíz del proyecto).
 # El modelo se picklea en la imagen de Airflow (DAG de comparación) y se carga en la
 # imagen de la API: cualquier desalineación de versión rompe mlflow.sklearn.load_model.
 scikit-learn==1.9.1
 xgboost==3.4.1
 mlflow==3.17.0
+skops==0.16.0
 numpy==2.5.3
 pandas==3.0.6
 boto3==1.43.110

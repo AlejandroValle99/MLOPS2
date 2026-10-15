@@ -29,6 +29,7 @@ ml = [
     "numpy>=1.26.0",
     "pandas>=2.2.0",
     "scikit-learn>=1.5.0",
+    "skops>=0.16.0",
     "xgboost>=3.2.0",
 ]
 serve = [
@@ -64,3 +65,8 @@ check_untyped_defs = true
 # makes sure the repo root itself is on sys.path so `import model.preprocess` etc. work
 # without installing the project.
 pythonpath = ["."]
+filterwarnings = [
+    # MLflow's hint that integer columns can't hold missing values when it enforces a model's
+    # input schema. The services load the scikit-learn model directly and never enforce it.
+    "ignore:Hint. Inferred schema contains integer column:UserWarning",
+]
