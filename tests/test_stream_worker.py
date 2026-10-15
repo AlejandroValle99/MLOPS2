@@ -19,6 +19,7 @@ from services.stream_worker.main import (
     ALERTS_TOPIC,
     DLQ_TOPIC,
     PREDICTIONS_TOPIC,
+    WINDOWS_TOPIC,
     make_scorer,
     process_once,
     publish_report,
@@ -299,6 +300,38 @@ def test_a_closed_window_with_an_alert_is_published_to_drift_alerts(broker):
     ((key, alert),) = broker.producer.on(ALERTS_TOPIC)
     assert key == b"rural-60plus"
     assert alert["feature"] == "avg_glucose_level" and alert["psi"] == 0.71
+
+
+def test_every_closed_window_is_published_to_window_reports_alert_or_not(broker):
+    report = {
+        "hospital_id": "urban-under60",
+        "window_start": 1.0,
+        "window_end": 9.0,
+        "psi": {"avg_glucose_level": 0.03},
+        "alerts": [],
+        "model_versions": ["7"],
+    }
+    publish_report(broker.producer, report)
+    broker.producer.flush()
+    assert broker.producer.on(WINDOWS_TOPIC) == [(b"urban-under60", report)]
+    assert broker.producer.on(ALERTS_TOPIC) == []
+
+
+def test_a_window_report_holds_counts_and_psi_never_patient_features(
+    broker, score, model_server, make_state
+):
+    model_server.holder.set(make_state(version="7"))
+    consumer = broker.consumer([event(n) for n in range(3)])
+    process_once(consumer, broker.producer, score, Monitor(BASELINES, window_events=3))
+    ((key, report),) = broker.producer.on(WINDOWS_TOPIC)
+    assert key == b"rural-60plus" and report["count"] == 3
+    assert report["model_versions"] == ["7"]
+    assert set(report) == {
+        "hospital_id", "window_start", "window_end", "count", "throughput_eps",
+        "latency_p50_ms", "latency_p95_ms", "positive_rate", "psi", "warnings", "alerts",
+        "model_versions",
+    }  # fmt: skip
+    assert consumer.committed == 3  # the report was flushed with the predictions
 
 
 def test_the_worker_imports_neither_scikit_learn_nor_mlflow():

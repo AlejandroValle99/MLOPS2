@@ -4,8 +4,9 @@ Reads patient-intake events from `patient-events` and checks each one against th
 contract. Valid events are scored through the model server, one PredictBatch call per
 poll, and each score is published to `predictions`, keyed by hospital, for that hospital
 to read. Events that fail the check go to `patient-events-dlq` instead, so one bad event
-never blocks the rest. Every scored event also feeds its hospital's drift window; a
-sustained shift is published to `drift-alerts`.
+never blocks the rest. Every scored event also feeds its hospital's drift window. Each
+closed window's report (throughput, latency, positive rate, PSI) is published to
+`window-reports`, and a sustained shift to `drift-alerts`.
 
 Delivery is at least once: a batch's offsets are committed only after everything it
 produced is on the broker, so a crash can repeat a few predictions but never lose one.
@@ -35,6 +36,7 @@ log = logging.getLogger(__name__)
 EVENTS_TOPIC = "patient-events"
 PREDICTIONS_TOPIC = "predictions"
 ALERTS_TOPIC = "drift-alerts"
+WINDOWS_TOPIC = "window-reports"
 DLQ_TOPIC = "patient-events-dlq"
 
 # A dead-letter message keeps at most this much of the rejected event: enough to see what
@@ -100,9 +102,12 @@ def dead_letter_message(raw: bytes | None, error: str, rejected_at: float) -> by
 
 
 def publish_report(producer: Any, report: dict) -> list[Any]:
-    """Log a closed window; publish one alert per feature that fired. Returns the sends."""
+    """Log and publish a closed window's report, then one alert per feature that fired.
+    The report holds counts and PSI values only, never a patient's features. Returns the
+    sends."""
     log.info("window %s", json.dumps(report))
-    sent = []
+    key = report["hospital_id"].encode()
+    sent = [producer.send(WINDOWS_TOPIC, key=key, value=_json(report))]
     for feature in report["alerts"]:
         alert = {
             "hospital_id": report["hospital_id"],
@@ -113,7 +118,6 @@ def publish_report(producer: Any, report: dict) -> list[Any]:
             "model_versions": report["model_versions"],
         }
         log.warning("drift alert %s", json.dumps(alert))
-        key = report["hospital_id"].encode()
         sent.append(producer.send(ALERTS_TOPIC, key=key, value=_json(alert)))
     return sent
 
