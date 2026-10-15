@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import grpc
+import mlflow
 import pytest
 from grpc_health.v1 import health
 from sklearn.linear_model import LogisticRegression
@@ -13,6 +14,7 @@ from sklearn.pipeline import Pipeline
 from model.preprocess import build_feature_pipeline
 from services.model_server.holder import ModelHolder, ModelState
 from services.model_server.main import create_server
+from stroke.config import EXPERIMENT_NAME
 from stroke.data import load_clean, split_train_test
 from stroke_rpc.v1 import scoring_pb2_grpc as pb_grpc
 
@@ -90,3 +92,17 @@ def model_server():
 def stub(model_server):
     with grpc.insecure_channel(model_server.target) as channel:
         yield pb_grpc.ScoringStub(channel)
+
+
+@pytest.fixture(scope="session")
+def mlflow_store(tmp_path_factory):
+    """A throwaway MLflow for the whole session: sqlite for runs and the registry, a temporary
+    folder for artifacts, no server. The experiment is created here with its artifact folder
+    set, so nothing ever lands in the repo. Tests that register models use their own model
+    name, so they don't see each other's versions or aliases."""
+    root = tmp_path_factory.mktemp("mlflow")
+    previous = mlflow.get_tracking_uri()
+    mlflow.set_tracking_uri(f"sqlite:///{root}/mlflow.db")
+    mlflow.create_experiment(EXPERIMENT_NAME, artifact_location=(root / "artifacts").as_uri())
+    yield mlflow.get_tracking_uri()
+    mlflow.set_tracking_uri(previous)
