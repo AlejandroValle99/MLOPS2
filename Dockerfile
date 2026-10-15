@@ -17,6 +17,8 @@ ENV GIT_PYTHON_REFRESH=quiet
 COPY api/ ./api/
 COPY model/ ./model/
 COPY stroke/ ./stroke/
+# The generated gRPC code and convert.py: the API is a client of the model server.
+COPY stroke_rpc/ ./stroke_rpc/
 
 EXPOSE 8000
 

@@ -9,12 +9,13 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import uuid4
 
+import grpc
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 
 from api.data import apply_mutations, fetch_dataset
-from api.predictor import LocalPredictor, ModelInfo, Predictor
+from api.predictor import GrpcPredictor, LocalPredictor, ModelInfo, Predictor
 from api.schemas import StrokeInput, StrokePrediction
 
 log = logging.getLogger(__name__)
@@ -23,6 +24,18 @@ log = logging.getLogger(__name__)
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 MODEL_NAME = os.getenv("MODEL_NAME", "stroke-model")
 MODEL_ALIAS = os.getenv("MODEL_ALIAS", "champion")
+
+# What a REST caller sees when a call to the model server fails. Anything else is a 500.
+GRPC_TO_HTTP = {
+    grpc.StatusCode.INVALID_ARGUMENT: 422,  # bad input reached the model server
+    grpc.StatusCode.UNAVAILABLE: 503,  # model server down, or no model loaded yet
+    grpc.StatusCode.RESOURCE_EXHAUSTED: 503,  # model server shedding load
+    grpc.StatusCode.DEADLINE_EXCEEDED: 504,  # slower than our deadline
+    # Our own credentials towards the model server are wrong: not the caller's fault,
+    # so never a 401 (that would tell the caller to fix a key they don't control).
+    grpc.StatusCode.UNAUTHENTICATED: 502,
+    grpc.StatusCode.PERMISSION_DENIED: 502,
+}
 
 _api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=False)
 
@@ -40,13 +53,21 @@ ApiKeyDep = Annotated[str, Depends(require_api_key)]
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     predictor: Predictor
-    try:
-        predictor = LocalPredictor.from_registry(MLFLOW_TRACKING_URI, MODEL_NAME, MODEL_ALIAS)
-    except Exception as exc:
-        log.warning("no model loaded at startup: %s", exc)
-        predictor = LocalPredictor()
+    target = os.getenv("MODEL_SERVER_TARGET")
+    if target:
+        # The model lives in the gRPC model server, which also hot-reloads it.
+        predictor = GrpcPredictor(target, float(os.getenv("RPC_TIMEOUT_S", "2")))
+    else:
+        # No model server configured: load the champion into this process, once.
+        try:
+            predictor = LocalPredictor.from_registry(MLFLOW_TRACKING_URI, MODEL_NAME, MODEL_ALIAS)
+        except Exception as exc:
+            log.warning("no model loaded at startup: %s", exc)
+            predictor = LocalPredictor()
     app.state.predictor = predictor
     yield
+    if isinstance(predictor, GrpcPredictor):
+        predictor.close()
 
 
 def get_predictor(request: Request) -> Predictor:
@@ -57,6 +78,17 @@ PredictorDep = Annotated[Predictor, Depends(get_predictor)]
 
 
 app = FastAPI(title="Stroke Prediction API", version="0.1.0", lifespan=lifespan)
+
+
+@app.exception_handler(grpc.RpcError)
+async def grpc_error(request: Request, exc: grpc.RpcError) -> JSONResponse:
+    # An RpcError raised by a call is also a grpc.Call, which is where code() and details() live
+    status = GRPC_TO_HTTP.get(exc.code(), 500)
+    # Only the code in the log: details() can quote feature values ("age ... got 130.0"),
+    # and patient features must never end up in logs. The caller still gets the details.
+    log.warning("model server call failed: %s -> HTTP %d", exc.code(), status)
+    return JSONResponse(status_code=status, content={"detail": exc.details()})
+
 
 v1 = APIRouter(prefix="/v1")
 

@@ -189,12 +189,48 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
+  # ── gRPC model server ───────────────────────────────────────────────────────
+  # Holds the champion model and hot-reloads it when the alias moves. The API (and later
+  # the stream worker) score through it, so there is one model in memory for every client.
+  model-server:
+    build:
+      context: .
+      dockerfile: services/model_server/Dockerfile
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      MODEL_NAME: ${MODEL_NAME}
+      MODEL_ALIAS: ${MODEL_ALIAS}
+      RELOAD_INTERVAL_S: "${RELOAD_INTERVAL_S:-10}"
+      GRPC_MAX_WORKERS: "${GRPC_MAX_WORKERS:-8}"
+      GRPC_MAX_CONCURRENT_RPCS: "${GRPC_MAX_CONCURRENT_RPCS:-32}"
+    ports:
+      - "50051:50051"
+    healthcheck:
+      # SERVING only once a model is loaded, so the API waits for a usable model server
+      test: ["CMD", "python", "-m", "services.model_server.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      model-init:
+        condition: service_completed_successfully  # a champion exists before we start
+    restart: unless-stopped
+
   # ── FastAPI serving ─────────────────────────────────────────────────────────
   api:
     build:
       context: .
       dockerfile: Dockerfile
     environment:
+      # Set: the API scores through the model server. Unset: it loads the model itself.
+      MODEL_SERVER_TARGET: model-server:50051
+      RPC_TIMEOUT_S: "${RPC_TIMEOUT_S:-2}"
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
@@ -211,8 +247,8 @@ services:
     depends_on:
       mlflow:
         condition: service_healthy
-      model-init:
-        condition: service_completed_successfully
+      model-server:
+        condition: service_healthy
     restart: unless-stopped
 
 # ─── volumes ──────────────────────────────────────────────────────────────────

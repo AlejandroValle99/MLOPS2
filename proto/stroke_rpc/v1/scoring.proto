@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package stroke_rpc.v1;
+
+enum Gender {
+    GENDER_UNSPECIFIED = 0;
+    GENDER_MALE = 1;
+    GENDER_FEMALE = 2;
+}
+
+enum WorkType {
+    WORK_TYPE_UNSPECIFIED = 0;
+    WORK_TYPE_PRIVATE = 1;
+    WORK_TYPE_SELF_EMPLOYED = 2;
+    WORK_TYPE_GOVT_JOB = 3;
+    WORK_TYPE_CHILDREN = 4;
+    WORK_TYPE_NEVER_WORKED = 5;
+}
+
+enum ResidenceType {
+    RESIDENCE_TYPE_UNSPECIFIED = 0;
+    RESIDENCE_TYPE_URBAN = 1;
+    RESIDENCE_TYPE_RURAL = 2;
+}
+
+enum SmokingStatus {
+    SMOKING_STATUS_UNSPECIFIED = 0;
+    SMOKING_STATUS_UNKNOWN = 1;
+    SMOKING_STATUS_FORMERLY_SMOKED = 2;
+    SMOKING_STATUS_NEVER_SMOKED = 3;
+    SMOKING_STATUS_SMOKES = 4;
+}
+
+enum EverMarried {
+    EVER_MARRIED_UNSPECIFIED = 0;
+    EVER_MARRIED_YES = 1;
+    EVER_MARRIED_NO = 2;
+}
+
+message Patient {
+    string patient_id = 1;
+    Gender gender = 2;
+    double age = 3;
+    int32 hypertension = 4;
+    int32 heart_disease = 5;
+    EverMarried ever_married = 6;
+    SmokingStatus smoking_status = 7;
+    WorkType work_type = 8;
+    ResidenceType residence_type = 9;
+    double avg_glucose_level = 10;
+    optional double bmi = 11;
+}
+
+message PredictRequest {
+    Patient patient = 1;
+    string request_id = 2;
+}
+
+message PredictBatchRequest {
+    repeated PredictRequest requests = 1;
+}
+
+message Prediction {
+    string request_id = 1;
+    double probability = 2;
+    bool high_risk = 3;
+    double threshold = 4;
+    string model_name = 5;
+    string model_version = 6;
+    optional string model_family = 7; 
+}
+
+message ModelInfoRequest {}
+
+message ModelInfo {
+    string name = 1;
+    string version = 2;
+    double threshold = 3;
+    optional string family = 4;
+    optional string data_version = 5;
+    int64 loaded_at_unix = 6;
+}
+
+service Scoring {
+    rpc Predict(PredictRequest) returns (Prediction);
+    rpc PredictBatch(PredictBatchRequest) returns (stream Prediction);
+    rpc GetModelInfo(ModelInfoRequest) returns (ModelInfo);
+}

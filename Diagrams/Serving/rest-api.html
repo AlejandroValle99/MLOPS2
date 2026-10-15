@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>REST API Serving</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --panel: #ffffff; --soft: #ecebe5; --fg: #1d2127; --muted: #5d646d;
+    --line: #8d949c; --accent: #c2410c; --accent-soft: #fdede3;
+    --err: #b42318; --err-soft: #fdecea; --ok: #17803d; --ok-soft: #e7f4ea;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141619; --panel: #1d2024; --soft: #262a30; --fg: #e7e9ec; --muted: #9ba3ad;
+      --line: #6b737d; --accent: #fb8c4a; --accent-soft: #3b2417;
+      --err: #f47a6e; --err-soft: #3a1f1d; --ok: #5fd18a; --ok-soft: #173223;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141619; --panel: #1d2024; --soft: #262a30; --fg: #e7e9ec; --muted: #9ba3ad;
+    --line: #6b737d; --accent: #fb8c4a; --accent-soft: #3b2417;
+    --err: #f47a6e; --err-soft: #3a1f1d; --ok: #5fd18a; --ok-soft: #173223;
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans); }
+  main { max-width: 1160px; margin: 0 auto; padding: 28px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .sub { color: var(--muted); margin: 0 0 26px; }
+  figure { margin: 0 0 40px; }
+  .scroll { overflow-x: auto; }
+  figcaption { color: var(--muted); font-size: 14px; margin-top: 10px; max-width: 90ch; }
+  code { font-family: var(--mono); font-size: 0.92em; }
+  table { border-collapse: collapse; font-size: 14px; width: 100%; max-width: 900px; }
+  th, td { text-align: left; padding: 7px 12px 7px 0; border-bottom: 1px solid var(--soft); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  td:first-child { white-space: nowrap; }
+  svg { display: block; width: 100%; min-width: 920px; height: auto; }
+  svg text { font-family: var(--sans); font-size: 12px; fill: var(--fg); }
+  svg .t { font-size: 14px; font-weight: 600; }
+  svg .m { font-size: 11.5px; fill: var(--muted); }
+  svg .c { font-family: var(--mono); font-size: 11.5px; white-space: pre; }
+  svg .h { font-size: 11px; font-weight: 600; letter-spacing: .08em; fill: var(--muted); }
+  svg .box { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; }
+  svg .group { fill: var(--soft); stroke: var(--line); stroke-width: 1; }
+  svg .data { fill: var(--soft); stroke: none; }
+  svg .hl { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.8; }
+  svg .hl-text { fill: var(--accent); }
+  svg .err { fill: var(--err-soft); stroke: var(--err); stroke-width: 1.2; }
+  svg .err-text { fill: var(--err); font-weight: 600; }
+  svg .ok { fill: var(--ok-soft); stroke: var(--ok); stroke-width: 1.2; }
+  svg .ok-text { fill: var(--ok); font-weight: 600; }
+  svg .e { fill: none; stroke: var(--fg); stroke-width: 1.3; }
+  svg .e-err { fill: none; stroke: var(--err); stroke-width: 1.3; }
+  svg .e-ok { fill: none; stroke: var(--ok); stroke-width: 1.6; }
+  svg .dash { stroke-dasharray: 5 4; }
+  svg .link { fill: none; stroke: var(--line); stroke-width: 1; stroke-dasharray: 2 4; }
+  svg .ah { fill: var(--fg); }
+  svg .ah-err { fill: var(--err); }
+  svg .ah-ok { fill: var(--ok); }
+</style>
+</head>
+<body>
+<main>
+  <h1>REST API Serving</h1>
+  <p class="sub">The FastAPI service on its own, with the model loaded into its process
+  (<code>MODEL_SERVER_TARGET</code> unset). MLflow and MinIO appear only where the API touches them.</p>
+
+  <h2>1 · Startup: how the API gets its model</h2>
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 24 1120 246" role="img" aria-label="At startup the API asks the MLflow registry which version holds the champion alias, loads that version's files from MinIO, and stores the result as app.state.predictor. If any of that fails, the API starts with an empty predictor and answers 503.">
+      <defs>
+        <marker id="r1-a" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+        <marker id="r1-r" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-err"/></marker>
+      </defs>
+
+      <rect class="box" x="20" y="40" width="190" height="80" rx="8"/>
+      <text class="t" x="36" y="70">uvicorn starts</text>
+      <text class="m" x="36" y="90">lifespan() runs once,</text>
+      <text class="m" x="36" y="106">before the first request</text>
+      <path class="e" d="M210,80 H248" marker-end="url(#r1-a)"/>
+
+      <rect class="box" x="250" y="40" width="230" height="80" rx="8"/>
+      <text class="c" x="266" y="70" font-weight="600">MODEL_SERVER_TARGET</text>
+      <text class="m" x="266" y="90">not set: the model lives</text>
+      <text class="m" x="266" y="106">inside the API process</text>
+      <path class="e" d="M480,80 H518" marker-end="url(#r1-a)"/>
+
+      <rect class="box" x="520" y="40" width="250" height="80" rx="8"/>
+      <text class="t" x="536" y="68">Load the champion</text>
+      <text class="c" x="536" y="88">LocalPredictor.from_registry</text>
+      <text class="m" x="536" y="106">calls 1 and 2 below</text>
+      <path class="e" d="M770,80 H808" marker-end="url(#r1-a)"/>
+      <text class="m" x="789" y="72" text-anchor="middle">ok</text>
+
+      <rect class="hl" x="810" y="40" width="290" height="80" rx="8"/>
+      <text class="c hl-text" x="826" y="68" font-weight="600">app.state.predictor</text>
+      <text class="m" x="826" y="88">LocalPredictor(model, ModelInfo)</text>
+      <text class="m" x="826" y="106">every request reuses this one object</text>
+
+      <!-- the two calls -->
+      <path class="e" d="M645,120 V178" marker-end="url(#r1-a)"/>
+      <path class="e" d="M740,120 V150 H955 V178" marker-end="url(#r1-a)"/>
+
+      <rect class="group" x="520" y="180" width="250" height="72" rx="8"/>
+      <text class="t" x="536" y="202">1 · MLflow registry</text>
+      <text class="c" x="536" y="222">get_model_version_by_alias</text>
+      <text class="m" x="536" y="240">→ version + tags (threshold, family)</text>
+
+      <rect class="group" x="810" y="180" width="290" height="72" rx="8"/>
+      <text class="t" x="826" y="202">2 · Model files from MinIO</text>
+      <text class="c" x="826" y="222">load_model("models:/stroke-model/7")</text>
+      <text class="m" x="826" y="240">→ the fitted scikit-learn pipeline</text>
+
+      <!-- failure -->
+      <path class="e-err dash" d="M560,120 V150 H240 V178" marker-end="url(#r1-r)"/>
+      <text class="err-text" x="400" y="144" text-anchor="middle" font-size="11.5">raises</text>
+      <rect class="err" x="20" y="180" width="440" height="72" rx="8"/>
+      <text class="err-text" x="36" y="202" font-size="13">MLflow down, or no @champion yet</text>
+      <text class="m" x="36" y="222">the error is logged and the API starts anyway, holding</text>
+      <text class="m" x="36" y="240">an empty LocalPredictor(): /ready and /v1/predict → 503</text>
+    </svg>
+    </div>
+    <figcaption>
+      The model is loaded exactly once. Its <code>ModelInfo</code> (name, version, threshold tag
+      with 0.5 as the default, family, data version) is fixed at that moment, so moving
+      <code>@champion</code> in MLflow later changes nothing until the API restarts.
+    </figcaption>
+  </figure>
+
+  <h2>2 · One <code>POST /v1/predict</code>, stage by stage</h2>
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 1120 656" role="img" aria-label="A prediction request passes seven stages: API key check (fails with 401), Pydantic body validation (422), model loaded check (503), request id, conversion to a dataset row, scoring with predict_proba, and the StrokePrediction response (200).">
+      <defs>
+        <marker id="r2-a" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+        <marker id="r2-r" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-err"/></marker>
+        <marker id="r2-g" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-ok"/></marker>
+      </defs>
+
+      <text class="h" x="20" y="24">WHAT THE DATA LOOKS LIKE</text>
+      <text class="h" x="400" y="24">WHAT THE API DOES</text>
+      <text class="h" x="790" y="24">WHERE IT CAN STOP</text>
+
+      <!-- stages -->
+      <rect class="box" x="400" y="40" width="320" height="58" rx="8"/>
+      <text class="t" x="416" y="62">Request arrives</text>
+      <text class="c" x="416" y="82">POST /v1/predict</text>
+      <path class="e" d="M560,98 H560 V114" marker-end="url(#r2-a)"/>
+
+      <rect class="box" x="400" y="116" width="320" height="58" rx="8"/>
+      <text class="t" x="416" y="135">1 · API key</text>
+      <text class="c" x="416" y="151">require_api_key</text>
+      <text class="m" x="416" y="166">X-API-KEY must be one of API_KEYS</text>
+      <path class="e" d="M560,174 V190" marker-end="url(#r2-a)"/>
+
+      <rect class="box" x="400" y="192" width="320" height="58" rx="8"/>
+      <text class="t" x="416" y="211">2 · Body</text>
+      <text class="c" x="416" y="227">StrokeInput (Pydantic)</text>
+      <text class="m" x="416" y="242">types, ranges, allowed values, no extra fields</text>
+      <path class="e" d="M560,250 V266" marker-end="url(#r2-a)"/>
+
+      <rect class="box" x="400" y="268" width="320" height="58" rx="8"/>
+      <text class="t" x="416" y="287">3 · Model loaded?</text>
+      <text class="c" x="416" y="303">predictor.ready()</text>
+      <text class="m" x="416" y="318">false only if startup could not load one</text>
+      <path class="e" d="M560,326 V342" marker-end="url(#r2-a)"/>
+
+      <rect class="box" x="400" y="344" width="320" height="58" rx="8"/>
+      <text class="t" x="416" y="363">4 · Request id</text>
+      <text class="c" x="416" y="379">x_request_id or uuid4().hex</text>
+      <text class="m" x="416" y="394">echoed back so client and logs can match</text>
+      <path class="e" d="M560,402 V418" marker-end="url(#r2-a)"/>
+
+      <rect class="box" x="400" y="420" width="320" height="58" rx="8"/>
+      <text class="t" x="416" y="439">5 · Dataset row</text>
+      <text class="c" x="416" y="455">body.to_model_row()</text>
+      <text class="m" x="416" y="470">drops patient_id, renames Residence_type</text>
+      <path class="e" d="M560,478 V494" marker-end="url(#r2-a)"/>
+
+      <rect class="box" x="400" y="496" width="320" height="58" rx="8"/>
+      <text class="t" x="416" y="515">6 · Score</text>
+      <text class="c" x="416" y="531">predictor.predict(row, request_id)</text>
+      <text class="m" x="416" y="546">DataFrame([row]) → pipeline.predict_proba</text>
+      <path class="e" d="M560,554 V570" marker-end="url(#r2-a)"/>
+
+      <rect class="box" x="400" y="572" width="320" height="58" rx="8"/>
+      <text class="t" x="416" y="591">7 · Response</text>
+      <text class="c" x="416" y="607">StrokePrediction</text>
+      <text class="m" x="416" y="622">high_risk = p ≥ threshold, plus the model info</text>
+
+      <!-- exits -->
+      <path class="e-err" d="M720,145 H788" marker-end="url(#r2-r)"/>
+      <text class="m" x="754" y="139" text-anchor="middle">bad key</text>
+      <rect class="err" x="790" y="127" width="310" height="36" rx="18"/>
+      <text class="err-text" x="808" y="150">401</text>
+      <text class="m" x="842" y="150">missing or invalid API key</text>
+
+      <path class="e-err" d="M720,221 H788" marker-end="url(#r2-r)"/>
+      <text class="m" x="754" y="215" text-anchor="middle">invalid</text>
+      <rect class="err" x="790" y="203" width="310" height="36" rx="18"/>
+      <text class="err-text" x="808" y="226">422</text>
+      <text class="m" x="842" y="226">detail names the field, e.g. "age"</text>
+
+      <path class="e-err" d="M720,297 H788" marker-end="url(#r2-r)"/>
+      <text class="m" x="754" y="291" text-anchor="middle">no model</text>
+      <rect class="err" x="790" y="279" width="310" height="36" rx="18"/>
+      <text class="err-text" x="808" y="302">503</text>
+      <text class="m" x="842" y="302">no model loaded</text>
+
+      <path class="e-ok" d="M720,601 H788" marker-end="url(#r2-g)"/>
+      <rect class="ok" x="790" y="583" width="310" height="36" rx="18"/>
+      <text class="ok-text" x="808" y="606">200</text>
+      <text class="m" x="842" y="606">StrokePrediction as JSON</text>
+
+      <!-- data shapes -->
+      <rect class="data" x="20" y="38" width="310" height="80" rx="8"/>
+      <text class="c" x="34" y="58">X-API-KEY: dev-key</text>
+      <text class="c" x="34" y="76">{"gender": "Male", "age": 67,</text>
+      <text class="c" x="34" y="92"> "residence_type": "Urban",</text>
+      <text class="c" x="34" y="108"> "bmi": null, ...}</text>
+      <path class="link" d="M330,69 H398"/>
+
+      <rect class="data" x="20" y="416" width="310" height="66" rx="8"/>
+      <text class="c" x="34" y="436">{"gender": "Male", "age": 67.0,</text>
+      <text class="c" x="34" y="452"> "Residence_type": "Urban",</text>
+      <text class="c" x="34" y="468"> "bmi": None, ...}  # a dict</text>
+      <path class="link" d="M330,449 H398"/>
+
+      <rect class="data" x="20" y="506" width="310" height="38" rx="8"/>
+      <text class="c" x="34" y="530">p = proba[0, 1] = 0.8236</text>
+      <path class="link" d="M330,525 H398"/>
+
+      <rect class="data" x="20" y="562" width="310" height="80" rx="8"/>
+      <text class="c" x="34" y="582">{"request_id": "c776…",</text>
+      <text class="c" x="34" y="598"> "probability": 0.8236,</text>
+      <text class="c" x="34" y="614"> "high_risk": true, "threshold": 0.3,</text>
+      <text class="c" x="34" y="630"> "model_version": "7", ...}</text>
+      <path class="link" d="M330,601 H398"/>
+    </svg>
+    </div>
+    <figcaption>
+      The order matters: FastAPI checks the API key before it validates the body, so a bad body
+      sent without a key gets 401, not 422. A request that fails a stage stops there. Only stage 6
+      touches the model, and it uses the object loaded at startup; nothing is fetched per request.
+    </figcaption>
+  </figure>
+
+  <h2>The other routes</h2>
+  <table>
+    <tr><th>Route</th><th>API key</th><th>Answers</th></tr>
+    <tr><td><code>GET /v1/model</code></td><td>yes</td><td>name, version, threshold, family, data_version of the loaded model; 503 without one</td></tr>
+    <tr><td><code>GET /ready</code></td><td>no</td><td>200 with <code>model_version</code> once a model is loaded; 503 before (readiness)</td></tr>
+    <tr><td><code>GET /health</code></td><td>no</td><td>200 whenever the process is up, model or not (liveness)</td></tr>
+    <tr><td><code>GET /dataset</code></td><td>no</td><td>the dataset CSV read from MinIO's <code>datasets</code> bucket, sampled (80%) with small noise added; the retraining DAG pulls it</td></tr>
+  </table>
+</main>
+</body>
+</html>
