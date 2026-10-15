@@ -3,14 +3,16 @@ with the offline model. No MLflow needed: the predictor is swapped for one holdi
 the `tiny_model` fixture (tests/conftest.py) through FastAPI's dependency_overrides.
 """
 
+import time
 from dataclasses import replace
 
+import grpc
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app, get_predictor
-from api.predictor import LocalPredictor, ModelInfo
+from api.predictor import GrpcPredictor, LocalPredictor, ModelInfo, Predictor
 from scripts.mini_tp1_client import EXPECTED, VALID, run
 
 KEY = {"X-API-KEY": "test-key"}
@@ -19,7 +21,7 @@ INFO = ModelInfo(
 )
 
 
-def serve(predictor: LocalPredictor) -> None:
+def serve(predictor: Predictor) -> None:
     """Make every route receive `predictor` instead of the one the lifespan would load."""
     app.dependency_overrides[get_predictor] = lambda: predictor
 
@@ -184,3 +186,114 @@ def test_api_probability_matches_offline_predict_proba(client, tiny_model, split
 def test_mini_tp1_client_shows_200_then_422_then_401(client):
     client.headers.update(KEY)  # the script's own main() sets this from API_KEY
     assert run(client) == EXPECTED
+
+
+# --- through the gRPC model server (GrpcPredictor) -----------------------------------------
+
+
+class SlowModel:
+    """Answers correctly, but slower than the API's deadline."""
+
+    def __init__(self, model) -> None:
+        self.model = model
+
+    def predict_proba(self, X):
+        time.sleep(0.5)
+        return self.model.predict_proba(X)
+
+
+class FakeRpcError(grpc.RpcError):
+    """What a failed stub call raises: an RpcError that also has code() and details()."""
+
+    def __init__(self, code: grpc.StatusCode) -> None:
+        self._code = code
+
+    def code(self) -> grpc.StatusCode:
+        return self._code
+
+    def details(self) -> str:
+        return f"model server said {self._code.name}"
+
+
+class FailingPredictor(LocalPredictor):
+    def __init__(self, code: grpc.StatusCode) -> None:
+        super().__init__(model=object(), info=INFO)
+        self.code = code
+
+    def predict(self, row: dict, request_id: str):
+        raise FakeRpcError(self.code)
+
+
+@pytest.fixture
+def via_grpc(client, model_server, make_state):
+    """The API wired to a real local model server, which starts out holding version 1."""
+    model_server.holder.set(make_state(version="1"))
+    predictor = GrpcPredictor(model_server.target, timeout_s=2)
+    serve(predictor)
+    yield model_server
+    predictor.close()
+
+
+def test_through_grpc_the_api_matches_offline_predict_proba(client, via_grpc, tiny_model, split):
+    _, X_test, _, _ = split
+    rows = X_test.head(20)
+    expected = tiny_model.predict_proba(rows)[:, 1]
+    for row, want in zip(rows.to_dict(orient="records"), expected, strict=True):
+        r = client.post("/v1/predict", json=as_request_body(row), headers=KEY)
+        assert r.status_code == 200
+        assert r.json()["probability"] == pytest.approx(want, abs=1e-12)
+
+
+def test_through_grpc_the_response_shows_the_version_that_scored_it(client, via_grpc, make_state):
+    assert client.post("/v1/predict", json=VALID, headers=KEY).json()["model_version"] == "1"
+    via_grpc.holder.set(make_state(version="2"))  # what a hot reload does
+    assert client.post("/v1/predict", json=VALID, headers=KEY).json()["model_version"] == "2"
+
+
+def test_through_grpc_ready_and_model_route_ask_the_model_server(client, via_grpc):
+    assert client.get("/ready").json()["model_version"] == "1"
+    assert client.get("/v1/model", headers=KEY).json()["data_version"] == "abc123"
+
+
+def test_through_grpc_a_model_server_without_a_model_is_503(client, model_server):
+    predictor = GrpcPredictor(model_server.target, timeout_s=2)
+    serve(predictor)
+    assert client.get("/ready").status_code == 503
+    assert client.post("/v1/predict", json=VALID, headers=KEY).status_code == 503
+    predictor.close()
+
+
+def test_a_model_server_that_is_down_is_503(client):
+    predictor = GrpcPredictor("localhost:1", timeout_s=1)  # nothing listens on port 1
+    serve(predictor)
+    assert client.get("/ready").status_code == 503
+    assert client.post("/v1/predict", json=VALID, headers=KEY).status_code == 503
+    predictor.close()
+
+
+def test_a_slow_model_server_is_504(client, model_server, make_state, tiny_model):
+    model_server.holder.set(make_state(model=SlowModel(tiny_model)))
+    predictor = GrpcPredictor(model_server.target, timeout_s=0.2)
+    serve(predictor)
+    r = client.post("/v1/predict", json=VALID, headers=KEY)
+    assert r.status_code == 504
+    predictor.close()
+
+
+@pytest.mark.parametrize(
+    "code, http",
+    [
+        (grpc.StatusCode.INVALID_ARGUMENT, 422),
+        (grpc.StatusCode.UNAVAILABLE, 503),
+        (grpc.StatusCode.RESOURCE_EXHAUSTED, 503),
+        (grpc.StatusCode.DEADLINE_EXCEEDED, 504),
+        (grpc.StatusCode.UNAUTHENTICATED, 502),
+        (grpc.StatusCode.PERMISSION_DENIED, 502),
+        (grpc.StatusCode.INTERNAL, 500),
+    ],
+)
+def test_grpc_status_codes_map_to_http_statuses(client, code, http):
+    serve(FailingPredictor(code))
+    r = client.post("/v1/predict", json=VALID, headers=KEY)
+    assert r.status_code == http
+    assert r.json() == {"detail": f"model server said {code.name}"}

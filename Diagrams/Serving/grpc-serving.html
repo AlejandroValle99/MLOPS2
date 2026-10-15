@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gRPC Model Serving</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --panel: #ffffff; --soft: #ecebe5; --fg: #1d2127; --muted: #5d646d;
+    --line: #8d949c; --accent: #c2410c; --accent-soft: #fdede3;
+    --err: #b42318; --err-soft: #fdecea; --ok: #17803d; --ok-soft: #e7f4ea;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141619; --panel: #1d2024; --soft: #262a30; --fg: #e7e9ec; --muted: #9ba3ad;
+      --line: #6b737d; --accent: #fb8c4a; --accent-soft: #3b2417;
+      --err: #f47a6e; --err-soft: #3a1f1d; --ok: #5fd18a; --ok-soft: #173223;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141619; --panel: #1d2024; --soft: #262a30; --fg: #e7e9ec; --muted: #9ba3ad;
+    --line: #6b737d; --accent: #fb8c4a; --accent-soft: #3b2417;
+    --err: #f47a6e; --err-soft: #3a1f1d; --ok: #5fd18a; --ok-soft: #173223;
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans); }
+  main { max-width: 1160px; margin: 0 auto; padding: 28px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .sub { color: var(--muted); margin: 0 0 26px; }
+  figure { margin: 0 0 40px; }
+  .scroll { overflow-x: auto; }
+  figcaption { color: var(--muted); font-size: 14px; margin-top: 10px; max-width: 90ch; }
+  code { font-family: var(--mono); font-size: 0.92em; }
+  table { border-collapse: collapse; font-size: 14px; width: 100%; max-width: 900px; margin-bottom: 40px; }
+  th, td { text-align: left; padding: 7px 12px 7px 0; border-bottom: 1px solid var(--soft); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  td:first-child { white-space: nowrap; }
+  svg { display: block; width: 100%; min-width: 920px; height: auto; }
+  svg text { font-family: var(--sans); font-size: 12px; fill: var(--fg); }
+  svg .t { font-size: 14px; font-weight: 600; }
+  svg .m { font-size: 11.5px; fill: var(--muted); }
+  svg .c { font-family: var(--mono); font-size: 11.5px; white-space: pre; }
+  svg .h { font-size: 11px; font-weight: 600; letter-spacing: .08em; fill: var(--muted); }
+  svg .box { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; }
+  svg .group { fill: var(--soft); stroke: var(--line); stroke-width: 1; }
+  svg .group-hl { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.6; }
+  svg .note { fill: var(--panel); stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 3; }
+  svg .hl { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.8; }
+  svg .hl-text { fill: var(--accent); }
+  svg .err { fill: var(--err-soft); stroke: var(--err); stroke-width: 1.2; }
+  svg .err-text { fill: var(--err); font-weight: 600; }
+  svg .ok { fill: var(--ok-soft); stroke: var(--ok); stroke-width: 1.2; }
+  svg .ok-text { fill: var(--ok); font-weight: 600; }
+  svg .neutral { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; }
+  svg .e { fill: none; stroke: var(--fg); stroke-width: 1.3; }
+  svg .e-hl { fill: none; stroke: var(--accent); stroke-width: 2; }
+  svg .e-err { fill: none; stroke: var(--err); stroke-width: 1.3; }
+  svg .e-ok { fill: none; stroke: var(--ok); stroke-width: 1.6; }
+  svg .e-m { fill: none; stroke: var(--line); stroke-width: 1.3; }
+  svg .dash { stroke-dasharray: 5 4; }
+  svg .life { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 4; }
+  svg .ah { fill: var(--fg); }
+  svg .ah-hl { fill: var(--accent); }
+  svg .ah-err { fill: var(--err); }
+  svg .ah-ok { fill: var(--ok); }
+  svg .ah-m { fill: var(--line); }
+  svg .dot { fill: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>gRPC Model Serving</h1>
+  <p class="sub">The API and the model-server, with the model living only in the model-server.
+  MLflow and MinIO appear only where the model-server touches them.</p>
+
+  <h2>1 · One <code>POST /v1/predict</code> across the two processes</h2>
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 1120 676" role="img" aria-label="Sequence of one prediction: the route validates the request, asks GrpcPredictor whether a model is ready, which calls GetModelInfo on the model-server; then GrpcPredictor packs the row into a PredictRequest and calls Predict with a 2 second deadline; the servicer reads the model holder once, unpacks and validates the patient, runs predict_proba and returns a Prediction that travels back to the client as JSON.">
+      <defs>
+        <marker id="g1-a" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+        <marker id="g1-h" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-hl"/></marker>
+      </defs>
+
+      <!-- processes -->
+      <rect class="group" x="196" y="10" width="478" height="660" rx="12"/>
+      <text class="h" x="212" y="31">API PROCESS · FASTAPI</text>
+      <rect class="group-hl" x="736" y="10" width="372" height="660" rx="12"/>
+      <text class="h hl-text" x="752" y="31">MODEL-SERVER PROCESS · :50051</text>
+      <text class="m" x="705" y="28" text-anchor="middle">gRPC</text>
+      <text class="m" x="705" y="42" text-anchor="middle">HTTP/2</text>
+
+      <!-- lifeline heads -->
+      <rect class="box" x="20" y="52" width="150" height="44" rx="8"/>
+      <text class="t" x="95" y="79" text-anchor="middle">Client</text>
+      <rect class="box" x="220" y="52" width="200" height="44" rx="8"/>
+      <text class="t" x="320" y="71" text-anchor="middle">route</text>
+      <text class="m" x="320" y="87" text-anchor="middle">api/main.py</text>
+      <rect class="box" x="450" y="52" width="200" height="44" rx="8"/>
+      <text class="t" x="550" y="71" text-anchor="middle">GrpcPredictor</text>
+      <text class="m" x="550" y="87" text-anchor="middle">api/predictor.py · one channel</text>
+      <rect class="box" x="760" y="52" width="160" height="44" rx="8"/>
+      <text class="t" x="840" y="71" text-anchor="middle">ScoringServicer</text>
+      <text class="m" x="840" y="87" text-anchor="middle">servicer.py</text>
+      <rect class="box" x="940" y="52" width="150" height="44" rx="8"/>
+      <text class="t" x="1015" y="71" text-anchor="middle">ModelHolder</text>
+      <text class="m" x="1015" y="87" text-anchor="middle">holder.py</text>
+
+      <!-- lifelines -->
+      <line class="life" x1="95" y1="96" x2="95" y2="664"/>
+      <line class="life" x1="320" y1="96" x2="320" y2="664"/>
+      <line class="life" x1="550" y1="96" x2="550" y2="664"/>
+      <line class="life" x1="840" y1="96" x2="840" y2="664"/>
+      <line class="life" x1="1015" y1="96" x2="1015" y2="664"/>
+
+      <!-- 1. request in -->
+      <path class="e" d="M95,124 H318" marker-end="url(#g1-a)"/>
+      <text x="207" y="118" text-anchor="middle">POST /v1/predict + X-API-KEY</text>
+      <rect class="note" x="236" y="136" width="168" height="40" rx="6"/>
+      <text class="m" x="320" y="152" text-anchor="middle">API key → Pydantic →</text>
+      <text class="c" x="320" y="168" text-anchor="middle">to_model_row()</text>
+
+      <!-- 2. readiness: one extra RPC -->
+      <path class="e" d="M320,200 H548" marker-end="url(#g1-a)"/>
+      <text x="435" y="194" text-anchor="middle">ready()</text>
+      <path class="e-hl" d="M550,228 H838" marker-end="url(#g1-h)"/>
+      <text class="hl-text" x="642" y="222" text-anchor="middle">GetModelInfo · deadline 2 s</text>
+      <path class="e" d="M840,252 H1013" marker-end="url(#g1-a)"/>
+      <text x="927" y="246" text-anchor="middle">get()</text>
+      <path class="e dash" d="M1015,274 H842" marker-end="url(#g1-a)"/>
+      <text class="m" x="927" y="268" text-anchor="middle">state</text>
+      <path class="e-hl dash" d="M840,300 H552" marker-end="url(#g1-h)"/>
+      <text class="hl-text" x="642" y="294" text-anchor="middle">ModelInfo</text>
+      <path class="e dash" d="M550,324 H322" marker-end="url(#g1-a)"/>
+      <text class="m" x="435" y="318" text-anchor="middle">True</text>
+
+      <!-- 3. the prediction -->
+      <path class="e" d="M320,360 H548" marker-end="url(#g1-a)"/>
+      <text x="435" y="354" text-anchor="middle">predict(row, request_id)</text>
+      <rect class="note" x="466" y="372" width="168" height="40" rx="6"/>
+      <text class="c" x="550" y="388" text-anchor="middle">request_from_record()</text>
+      <text class="m" x="550" y="404" text-anchor="middle">pack: row → PredictRequest</text>
+
+      <path class="e-hl" d="M550,440 H838" marker-end="url(#g1-h)"/>
+      <text class="hl-text" x="642" y="434" text-anchor="middle" font-weight="600">Predict · deadline 2 s</text>
+      <text class="m" x="642" y="456" text-anchor="middle">metadata: x-request-id</text>
+      <path class="e" d="M840,476 H1013" marker-end="url(#g1-a)"/>
+      <text x="927" y="470" text-anchor="middle">get() · once per call</text>
+      <path class="e dash" d="M1015,498 H842" marker-end="url(#g1-a)"/>
+      <text class="m" x="927" y="492" text-anchor="middle">state (model v7)</text>
+      <rect class="note" x="756" y="510" width="168" height="72" rx="6"/>
+      <text class="c" x="840" y="528" text-anchor="middle">validated_record()</text>
+      <text class="m" x="840" y="543" text-anchor="middle">unpack + range checks</text>
+      <text class="c" x="840" y="561" text-anchor="middle">predict_proba</text>
+      <text class="m" x="840" y="576" text-anchor="middle">→ Prediction</text>
+
+      <!-- 4. back out -->
+      <path class="e-hl dash" d="M840,604 H552" marker-end="url(#g1-h)"/>
+      <text class="hl-text" x="642" y="598" text-anchor="middle">Prediction (p, version 7)</text>
+      <path class="e dash" d="M550,628 H322" marker-end="url(#g1-a)"/>
+      <text class="m" x="435" y="622" text-anchor="middle">Scored (info from the Prediction)</text>
+      <path class="e dash" d="M320,652 H97" marker-end="url(#g1-a)"/>
+      <text class="m" x="207" y="646" text-anchor="middle">200 · StrokePrediction JSON</text>
+    </svg>
+    </div>
+    <figcaption>
+      Solid arrows are calls, dashed arrows are replies; highlighted arrows cross the network.
+      The servicer reads the holder once per call, so a hot reload in the middle of a request
+      cannot mix two models, and the version in the reply is the one that scored the patient.
+      The <code>ready()</code> check costs one extra, cheap RPC per prediction. Every call has a
+      2-second deadline (<code>RPC_TIMEOUT_S</code>), so a stuck model-server can never hang the API.
+    </figcaption>
+  </figure>
+
+  <h2>When a call fails</h2>
+  <table>
+    <tr><th>What went wrong</th><th>gRPC status</th><th>The REST client sees</th></tr>
+    <tr><td>A field unset or out of range</td><td><code>INVALID_ARGUMENT</code>, naming the field</td><td>422</td></tr>
+    <tr><td>No model loaded yet, or model-server down</td><td><code>UNAVAILABLE</code></td><td>503</td></tr>
+    <tr><td>More than 32 calls already in flight</td><td><code>RESOURCE_EXHAUSTED</code></td><td>503</td></tr>
+    <tr><td>Slower than the 2 s deadline</td><td><code>DEADLINE_EXCEEDED</code></td><td>504</td></tr>
+    <tr><td>Our own credentials refused</td><td><code>UNAUTHENTICATED</code>, <code>PERMISSION_DENIED</code></td><td>502 (not the caller's fault)</td></tr>
+    <tr><td>Anything else</td><td>other</td><td>500</td></tr>
+  </table>
+
+  <h2>2 · Hot reload: one check of the reloader thread</h2>
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 1120 676" role="img" aria-label="The reloader asks MLflow which version holds the champion alias. It stops if the registry is unreachable, if there is no champion, if the version is already served, or if it failed before. Otherwise it loads that version and scores one sample patient; on failure it remembers the version as bad and keeps the old model. On success it builds a new state and swaps it into the holder in one assignment. Then it waits and checks again.">
+      <defs>
+        <marker id="g2-a" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+        <marker id="g2-m" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-m"/></marker>
+        <marker id="g2-r" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-err"/></marker>
+        <marker id="g2-g" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-ok"/></marker>
+      </defs>
+
+      <!-- loop -->
+      <path class="e-m" d="M380,640 H45 V18 H500 V42" marker-end="url(#g2-m)"/>
+      <text class="m" x="272" y="34" text-anchor="middle">next check</text>
+
+      <!-- s1 -->
+      <rect class="box" x="320" y="44" width="360" height="80" rx="8"/>
+      <text class="t" x="336" y="68">Ask the registry</text>
+      <text class="c" x="336" y="90">get_model_version_by_alias(name, "champion")</text>
+      <text class="m" x="336" y="108">→ version v and its tags</text>
+      <rect class="group" x="90" y="56" width="180" height="56" rx="8"/>
+      <text class="t" x="106" y="80">MLflow</text>
+      <text class="m" x="106" y="98">registry: alias → version</text>
+      <path class="e" d="M320,84 H272" marker-end="url(#g2-a)"/>
+
+      <path class="e-err" d="M680,62 H748" marker-end="url(#g2-r)"/>
+      <text class="m" x="714" y="56" text-anchor="middle">error</text>
+      <rect class="err" x="750" y="40" width="350" height="44" rx="10"/>
+      <text class="c err-text" x="766" y="58">registry-unreachable</text>
+      <text class="m" x="766" y="74">MLflow down or failing: keep serving the current model</text>
+
+      <path class="e-m" d="M680,110 H748" marker-end="url(#g2-m)"/>
+      <text class="m" x="714" y="104" text-anchor="middle">none</text>
+      <rect class="neutral" x="750" y="88" width="350" height="44" rx="10"/>
+      <text class="c" x="766" y="106" font-weight="600">no-champion</text>
+      <text class="m" x="766" y="122">no registered model or no alias yet: nothing to load</text>
+
+      <path class="e" d="M500,124 V154" marker-end="url(#g2-a)"/>
+      <text class="m" x="510" y="143">found v</text>
+
+      <!-- s2 -->
+      <rect class="box" x="320" y="156" width="360" height="56" rx="8"/>
+      <text class="t" x="336" y="178">Already serving v?</text>
+      <text class="c" x="336" y="198">v == holder.get().version</text>
+      <path class="e-m" d="M680,184 H748" marker-end="url(#g2-m)"/>
+      <text class="m" x="714" y="178" text-anchor="middle">yes</text>
+      <rect class="neutral" x="750" y="162" width="350" height="44" rx="10"/>
+      <text class="c" x="766" y="180" font-weight="600">unchanged</text>
+      <text class="m" x="766" y="196">the common case: nothing to do</text>
+
+      <path class="e" d="M500,212 V240" marker-end="url(#g2-a)"/>
+      <text class="m" x="510" y="230">no</text>
+
+      <!-- s3 -->
+      <rect class="box" x="320" y="242" width="360" height="56" rx="8"/>
+      <text class="t" x="336" y="264">Failed before?</text>
+      <text class="c" x="336" y="284">v in bad_versions</text>
+      <path class="e-m" d="M680,270 H748" marker-end="url(#g2-m)"/>
+      <text class="m" x="714" y="264" text-anchor="middle">yes</text>
+      <rect class="neutral" x="750" y="248" width="350" height="44" rx="10"/>
+      <text class="c" x="766" y="266" font-weight="600">skipping-known-bad</text>
+      <text class="m" x="766" y="282">not retried and not logged again until a restart</text>
+
+      <path class="e" d="M500,298 V326" marker-end="url(#g2-a)"/>
+      <text class="m" x="510" y="316">no</text>
+
+      <!-- s4 -->
+      <rect class="box" x="320" y="328" width="360" height="72" rx="8"/>
+      <text class="t" x="336" y="350">Load v and warm it up</text>
+      <text class="c" x="336" y="370">load_model("models:/&lt;name&gt;/&lt;v&gt;")</text>
+      <text class="c" x="336" y="388">predict_proba(WARMUP_ROW)</text>
+      <rect class="group" x="90" y="336" width="180" height="56" rx="8"/>
+      <text class="t" x="106" y="360">MinIO</text>
+      <text class="m" x="106" y="378">model files, via MLflow</text>
+      <path class="e" d="M320,364 H272" marker-end="url(#g2-a)"/>
+
+      <path class="e-err" d="M680,364 H748" marker-end="url(#g2-r)"/>
+      <text class="m" x="714" y="358" text-anchor="middle">raises</text>
+      <rect class="err" x="750" y="342" width="350" height="44" rx="10"/>
+      <text class="c err-text" x="766" y="360">load-failed</text>
+      <text class="m" x="766" y="376">v goes into bad_versions; the old model keeps serving</text>
+
+      <path class="e" d="M500,400 V428" marker-end="url(#g2-a)"/>
+      <text class="m" x="510" y="418">ok</text>
+
+      <!-- s5 -->
+      <rect class="box" x="320" y="430" width="360" height="64" rx="8"/>
+      <text class="t" x="336" y="452">Build the new state</text>
+      <text class="m" x="336" y="470">threshold from the tag (0.5 if missing),</text>
+      <text class="m" x="336" y="486">model_family, data_version, loaded_at</text>
+
+      <path class="e" d="M500,494 V522" marker-end="url(#g2-a)"/>
+
+      <!-- s6 -->
+      <rect class="hl" x="320" y="524" width="360" height="64" rx="8"/>
+      <text class="t hl-text" x="336" y="546">Swap</text>
+      <text class="c" x="336" y="566">holder.set(state)</text>
+      <text class="m" x="336" y="582">one assignment: a call sees old or new, never a mix</text>
+      <path class="e-ok" d="M680,556 H748" marker-end="url(#g2-g)"/>
+      <rect class="ok" x="750" y="534" width="350" height="44" rx="10"/>
+      <text class="c ok-text" x="766" y="552">loaded</text>
+      <text class="m" x="766" y="568">first load ever: health switches to SERVING</text>
+
+      <path class="e" d="M500,588 V618" marker-end="url(#g2-a)"/>
+
+      <!-- wait -->
+      <rect class="neutral" x="380" y="620" width="240" height="40" rx="20"/>
+      <text class="c" x="500" y="645" text-anchor="middle">wait RELOAD_INTERVAL_S</text>
+    </svg>
+    </div>
+    <figcaption>
+      Every exit on the right ends this check; the thread then waits (10 s in compose) and starts
+      over. It loads the explicit version <code>v</code>, never <code>@champion</code>, so the alias
+      cannot move between the question and the load. The warm-up prediction is what catches a
+      model that loads but cannot score (for example one that needs a library the image lacks)
+      before it replaces a working one. Until the first <code>loaded</code>, the health service
+      answers NOT_SERVING, so Docker keeps the API from starting.
+    </figcaption>
+  </figure>
+
+  <h2>3 · <code>PredictBatch</code>: one message in, a stream out</h2>
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 1120 272" role="img" aria-label="The client sends one PredictBatchRequest with 600 requests. The server reads the holder once, validates every row, then scores chunks of 256 rows with one predict_proba call each, checking that the client is still there before each chunk, and yields one Prediction per row back to the client in order.">
+      <defs>
+        <marker id="g3-a" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+        <marker id="g3-h" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-hl"/></marker>
+      </defs>
+
+      <rect class="box" x="20" y="40" width="220" height="200" rx="8"/>
+      <text class="t" x="36" y="64">Client</text>
+      <text class="c" x="36" y="92">for p in stub.PredictBatch(</text>
+      <text class="c" x="36" y="108">        batch, timeout=10):</text>
+      <text class="c" x="36" y="124">    use(p)</text>
+      <text class="m" x="36" y="200">each p arrives while the</text>
+      <text class="m" x="36" y="216">server is still scoring</text>
+
+      <path class="e-hl" d="M240,76 H398" marker-end="url(#g3-h)"/>
+      <text class="c hl-text" x="319" y="68" text-anchor="middle">PredictBatchRequest</text>
+      <text class="m" x="319" y="94" text-anchor="middle">600 requests, 1 message</text>
+
+      <rect class="group-hl" x="400" y="24" width="700" height="236" rx="12"/>
+      <text class="t hl-text" x="416" y="48">model-server · PredictBatch</text>
+
+      <rect class="box" x="416" y="66" width="150" height="84" rx="8"/>
+      <text class="t" x="428" y="88" font-size="13">Read the holder</text>
+      <text class="m" x="428" y="108">once, for the whole</text>
+      <text class="m" x="428" y="124">stream: one version</text>
+      <path class="e" d="M566,108 H584" marker-end="url(#g3-a)"/>
+
+      <rect class="box" x="586" y="66" width="150" height="84" rx="8"/>
+      <text class="t" x="598" y="88" font-size="13">Validate all 600</text>
+      <text class="m" x="598" y="108">one bad row fails the</text>
+      <text class="m" x="598" y="124">call before any result</text>
+      <path class="e" d="M736,108 H754" marker-end="url(#g3-a)"/>
+
+      <text class="m" x="923" y="60" text-anchor="middle">chunks of 256, in order</text>
+      <rect class="box" x="756" y="66" width="106" height="84" rx="8"/>
+      <text class="c" x="768" y="88">rows 0–255</text>
+      <text class="m" x="768" y="108">is_active()?</text>
+      <text class="m" x="768" y="124">1 predict_proba</text>
+      <rect class="box" x="870" y="66" width="106" height="84" rx="8"/>
+      <text class="c" x="882" y="88">rows 256–511</text>
+      <text class="m" x="882" y="108">is_active()?</text>
+      <text class="m" x="882" y="124">1 predict_proba</text>
+      <rect class="box" x="984" y="66" width="106" height="84" rx="8"/>
+      <text class="c" x="996" y="88">rows 512–599</text>
+      <text class="m" x="996" y="108">is_active()?</text>
+      <text class="m" x="996" y="124">1 predict_proba</text>
+
+      <!-- the stream back -->
+      <line class="e-hl" x1="809" y1="150" x2="809" y2="214"/>
+      <line class="e-hl" x1="923" y1="150" x2="923" y2="214"/>
+      <line class="e-hl" x1="1037" y1="150" x2="1037" y2="214"/>
+      <path class="e-hl" d="M1037,214 H242" marker-end="url(#g3-h)"/>
+      <text class="m" x="600" y="206" text-anchor="middle">yield: one Prediction per row, in input order</text>
+      <circle class="dot" cx="270" cy="214" r="5"/>
+      <circle class="dot" cx="305" cy="214" r="5"/>
+      <circle class="dot" cx="340" cy="214" r="5"/>
+      <text class="c" x="270" y="236" text-anchor="middle">r0</text>
+      <text class="c" x="305" y="236" text-anchor="middle">r1</text>
+      <text class="c" x="340" y="236" text-anchor="middle">r2</text>
+      <text class="m" x="372" y="236" text-anchor="middle">…</text>
+    </svg>
+    </div>
+    <figcaption>
+      Only the response streams: the client already has its whole batch, so it sends it in one
+      message. Scoring in chunks keeps it fast (one <code>predict_proba</code> per 256 rows, not
+      per row), and the <code>is_active()</code> check before each chunk stops the work if the
+      client cancelled or its deadline passed. No client uses this yet; the stream worker will.
+    </figcaption>
+  </figure>
+</main>
+</body>
+</html>

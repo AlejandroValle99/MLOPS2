@@ -125,15 +125,17 @@ class ModelInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class ModelInfo(_message.Message):
-    __slots__ = ("name", "version", "threshold", "family", "data_version")
+    __slots__ = ("name", "version", "threshold", "family", "data_version", "loaded_at_unix")
     NAME_FIELD_NUMBER: _ClassVar[int]
     VERSION_FIELD_NUMBER: _ClassVar[int]
     THRESHOLD_FIELD_NUMBER: _ClassVar[int]
     FAMILY_FIELD_NUMBER: _ClassVar[int]
     DATA_VERSION_FIELD_NUMBER: _ClassVar[int]
+    LOADED_AT_UNIX_FIELD_NUMBER: _ClassVar[int]
     name: str
     version: str
     threshold: float
     family: str
     data_version: str
-    def __init__(self, name: _Optional[str] = ..., version: _Optional[str] = ..., threshold: _Optional[float] = ..., family: _Optional[str] = ..., data_version: _Optional[str] = ...) -> None: ...
+    loaded_at_unix: int
+    def __init__(self, name: _Optional[str] = ..., version: _Optional[str] = ..., threshold: _Optional[float] = ..., family: _Optional[str] = ..., data_version: _Optional[str] = ..., loaded_at_unix: _Optional[int] = ...) -> None: ...

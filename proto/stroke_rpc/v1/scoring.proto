@@ -78,6 +78,7 @@ message ModelInfo {
     double threshold = 3;
     optional string family = 4;
     optional string data_version = 5;
+    int64 loaded_at_unix = 6;
 }
 
 service Scoring {
