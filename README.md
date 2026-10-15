@@ -15,7 +15,9 @@ FastAPI service.
 overwrote the raw dataset, now guarded by a checksum manifest), and the REST API is
 complete (Mini-TP 1, below). The API scores through a gRPC model server that hot-reloads
 the champion model when it changes, and hospital systems can stream intake events to the
-same model. More rigorous training, the data lake and security are in progress.
+same model. Training calibrates every model and chooses its threshold, and a new model
+replaces the champion only with statistical evidence that it is better. The data lake and
+security are in progress.
 
 ## Architecture
 
@@ -28,7 +30,7 @@ hospital systems ──▶ Redpanda ──▶ stream-worker ──────�
                                         ├──▶ drift-alerts
                                         └──▶ patient-events-dlq (rejected events)
 
-Airflow :8080 ──▶ train, compare, promote ──▶ MLflow :5001 ──▶ model files in MinIO :9000
+Airflow :8080 ──▶ train, calibrate, gate ──▶ MLflow :5001 ──▶ model files in MinIO :9000
 PostgreSQL :5432 holds Airflow's and MLflow's metadata. Everything runs in Docker Compose.
 ```
 
@@ -40,13 +42,13 @@ PostgreSQL :5432 holds Airflow's and MLflow's metadata. Everything runs in Docke
 | `services/model_server/` | The gRPC model server: scoring, hot reload, health checks |
 | `services/stream_worker/` | The stream worker: validates intake events, scores them, publishes the scores, watches drift |
 | `services/producer/` | Replays the dataset as intake events from the hospitals (run from the laptop) |
-| `model/` | Feature pipeline and training |
-| `dags/` | Airflow DAGs: data prep, model comparison, production retrain |
+| `model/` | Feature pipeline and training (`train.py`: candidates, tuning, calibration, threshold) |
+| `dags/` | Airflow DAGs: training with the promotion gate, a retrain on a fresh snapshot |
 | `docker/` | Per-service Dockerfiles (Airflow, MLflow, Postgres init) |
-| `stroke/` | Lifecycle modules added for MLOps II: the raw-data manifest, the frozen split, the hospital rule and drift (PSI); evaluation and the registry as they are built |
+| `stroke/` | Lifecycle modules added for MLOps II: the raw-data manifest and frozen split, the hospital rule, drift (PSI), evaluation (metrics, threshold, the gate's statistics) and the registry (logging, the gate, promotion, rollback) |
 | `data/raw/` | The immutable source dataset + its integrity manifest |
 | `data/drift/` | The per-hospital drift baselines the stream worker compares against (generated, committed) |
-| `scripts/` | Command-line clients and utilities (`mini_tp1_client.py`, `hospital_inbox.py`, `build_drift_baseline.py`, `gen_proto.sh`) |
+| `scripts/` | Command-line clients and utilities (`mini_tp1_client.py`, `hospital_inbox.py`, `rollback.py`, `build_drift_baseline.py`, `gen_proto.sh`) |
 | `tests/` | pytest suite, one file per module under test; shared fixtures in `conftest.py` |
 
 ## Setup
@@ -229,6 +231,72 @@ After a change to the split, the cleaning or the drift code, regenerate the base
 uv run --group ml python -m scripts.build_drift_baseline
 ```
 
+## Training and promotion
+
+A model reaches patients only through one path: train every candidate, pick a finalist
+on training data alone, then let a statistical gate decide whether it replaces the current
+champion. Nothing moves the `champion` alias by hand except the documented rollback.
+
+**One training run** (`model/train.py`), for each candidate family: `age_only` (logistic
+regression on age alone, the floor every model has to beat), `logreg`, `random_forest`
+and `xgboost`:
+
+| Step | What happens | Why |
+|---|---|---|
+| Split | One stratified 80/20 split, fixed by seed, from the raw file after its checksum is verified | every model is judged on the same locked test rows |
+| Tune | Optuna (TPE, median pruning) maximizes mean 5-fold CV PR-AUC on the training rows | PR-AUC needs no threshold, so it is steadier than F2 with ~200 positives |
+| Calibrate | Sigmoid calibration on out-of-fold predictions | class weights inflate the scores on purpose; after calibration, 0.2 means about a 20% chance |
+| Threshold | The cut that maximizes F2 on out-of-fold calibrated probabilities | F2 weighs recall four times precision, and out-of-fold rows were never seen by the model scoring them |
+| Select | The finalist is the candidate with the best out-of-fold F2 | the test set picks nothing |
+| Log | Hyperparameters (`hp_*`), `oof_*` and `test_*` metrics (F2, recall, precision, ROC-AUC, PR-AUC, Brier, ECE, alert rate), the model, and the per-hospital drift baseline | the test set is scored once per candidate, for the record |
+
+**The gate** (`stroke/registry.py`). The finalist is registered as a new version of
+`stroke-model`, carrying its `threshold`, `model_family`, `data_version` and `test_split`
+tags. Then:
+
+- No champion yet: it is promoted.
+- The champion was judged on another test set, or on none (a model from before the gate):
+  the two can't be compared on equal terms, so the finalist is promoted and the reason says so.
+- Otherwise both models score the test set, each at its own threshold, over 2,000 paired,
+  stratified bootstrap resamples. The finalist is promoted only if its F2 is higher in at
+  least 90% of them (`GATE_MIN_P_BETTER`). A tie is not a win.
+
+Either way the version is tagged with the decision: `gate_decision`, `gate_reason`,
+`gate_p_better`, `gate_mean_diff`, `gate_ci90`, both F2 scores, and the champion it was
+compared with. A promotion keeps the old champion as `previous_champion`. Tags are set
+before the alias moves, because the model server reads a version's threshold when it
+loads it. Every model is logged set to predict on one thread: the model server scores one
+patient (or a few hundred) per call, where a thread pool costs more than it saves.
+
+**DAGs** (Airflow, http://localhost:8080; trigger them by hand):
+
+| DAG | Does | Parameters |
+|---|---|---|
+| `etl_train_models_process_taskflow` | `verify_raw`, one `train_<family>` task per candidate in parallel, then `register_and_gate` | `n_trials` (30), `gate_min_p_better` (0.90) |
+| `stroke_prediction_pipeline` | Retrains on a fresh snapshot (the same patients resampled, with noise), minus every frozen-test patient, then gates the finalist on the frozen test set | same |
+| `0_stroke_full_pipeline` | Triggers the first one and waits for it | — |
+
+`gate_min_p_better = 0` promotes the finalist whatever the comparison says. That is the
+only way to force a promotion, and it is still recorded as a gate decision. On the first
+start, `model-init` runs the same training and gate (10 trials per candidate) if there is
+no champion yet.
+
+**Rollback** puts `previous_champion` back, with its own threshold, within one reload
+interval of the model server. Only aliases move:
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5001 uv run --group ml python -m scripts.rollback
+```
+
+**How to read the results.** On this dataset (5,109 patients, 249 strokes, 50 in the test
+set) the candidates are close: age alone reaches a test ROC-AUC of 0.835, as high as the
+full models (0.81 to 0.84), and the out-of-fold and test rankings often disagree. So most challengers are
+rejected, and that is the gate working, not failing. Two limits to keep in mind: the
+bootstrap measures the uncertainty of the test sample, not how differently another
+training run (another seed, another snapshot) would have turned out; and every gate
+decision reuses the same test set, so a long series of decisions slowly fits it. A real
+deployment would refresh the test set over time.
+
 ## Not in this project, and why
 
 The course covers more layers than this service uses; each one here has a job.
@@ -256,18 +324,20 @@ uv run --group api --group ml uvicorn api.main:app --reload
 ## Tests
 
 ```bash
-uv run --group api --group ml --group serve --group stream --group dev pytest
+uv run --group api --group ml --group train --group serve --group stream --group dev pytest
 ```
 
-No running services are needed: the tests train a small model in memory, run a real gRPC
-model server on a local port, and stand in for the broker with fakes.
+No running services are needed: the tests train small models in memory, run a real gRPC
+model server on a local port, use a throwaway MLflow (sqlite and a temporary folder) for
+the registry and the gate, and stand in for the broker with fakes. The XGBoost tests skip
+on macOS when `libomp` is missing (`brew install libomp`).
 
 ## Lint, format, type check
 
 ```bash
 uv run ruff check .
 uv run ruff format .
-uv run --group api --group ml --group serve --group stream mypy model stroke api services stroke_rpc
+uv run --group api --group ml --group train --group serve --group stream mypy model stroke api services stroke_rpc
 ```
 
 ## Pre-commit hooks
