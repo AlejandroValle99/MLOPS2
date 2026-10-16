@@ -1255,6 +1255,11 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
 ]
+lake = [
+    { name = "boto3" },
+    { name = "kafka-python" },
+    { name = "pyarrow" },
+]
 ml = [
     { name = "boto3" },
     { name = "mlflow" },
@@ -1301,6 +1306,11 @@ dev = [
     { name = "pre-commit", specifier = ">=4.6.2" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.16.8" },
+]
+lake = [
+    { name = "boto3", specifier = ">=1.43.110" },
+    { name = "kafka-python", specifier = ">=3.0.11" },
+    { name = "pyarrow", specifier = ">=25.0.1" },
 ]
 ml = [
     { name = "boto3", specifier = ">=1.43.110" },

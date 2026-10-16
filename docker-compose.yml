@@ -93,6 +93,7 @@ services:
         mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
         mc mb --ignore-existing local/mlflow-artifacts
         mc mb --ignore-existing local/datasets
+        mc mb --ignore-existing local/lake
         mc cp --recursive /data/ local/datasets/
     restart: "no"
 
@@ -309,6 +310,7 @@ services:
         create patient-events-dlq
         create predictions
         create drift-alerts
+        create window-reports
         rpk topic alter-config patient-events patient-events-dlq \
           --set retention.ms=3600000 -X brokers=redpanda:9092
     depends_on:
@@ -331,6 +333,32 @@ services:
         condition: service_completed_successfully
       model-server:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Archives the stream's results in the lake bucket: predictions and window reports, as
+  # Parquet, one folder per day. Apart from the worker, so the worker holds no storage
+  # credentials, and a slow or broken MinIO never delays a hospital's scores.
+  lake-sink:
+    build:
+      context: .
+      dockerfile: services/lake_sink/Dockerfile
+    profiles: ["streaming"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      # boto3 reads these itself. Without AWS_ENDPOINT_URL_S3, and with AWS credentials,
+      # the same code writes to AWS S3 instead of MinIO.
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_DEFAULT_REGION: us-east-1
+      LAKE_BUCKET: lake
+      LAKE_BLOCK_RECORDS: "${LAKE_BLOCK_RECORDS:-1000}"
+      LAKE_FLUSH_S: "${LAKE_FLUSH_S:-30}"
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 # ─── volumes ──────────────────────────────────────────────────────────────────
