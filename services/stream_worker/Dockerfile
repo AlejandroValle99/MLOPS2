@@ -1,6 +1,6 @@
-FROM python:3.12-slim
+FROM python:3.12.15-slim-trixie
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /bin/
 
 WORKDIR /app
 
@@ -10,6 +10,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --group stream
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
 # Only what the worker imports: the REST contract (pydantic only), the drift math, the
 # gRPC code, the worker itself, and the per-hospital drift baselines.
@@ -19,5 +20,9 @@ COPY stroke_rpc/ ./stroke_rpc/
 COPY services/__init__.py ./services/
 COPY services/stream_worker/ ./services/stream_worker/
 COPY data/drift/reference_stats.json ./data/drift/
+
+# Never root at run time
+RUN useradd --uid 10001 app
+USER app
 
 CMD ["python", "-m", "services.stream_worker.main"]
