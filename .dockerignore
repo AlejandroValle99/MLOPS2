@@ -1,10 +1,24 @@
+# Only what the images COPY should reach the build context. Above all: no secrets
+# (.env files, the TLS keys) and no data that isn't needed.
+.env
+.env.*
+certs/
 .venv
 .git
 .vscode
+.claude
 __pycache__
 *.pyc
 .mypy_cache
 .ruff_cache
 .pytest_cache
 .pre-commit-config.yaml
+.DS_Store
 README.md
+CLAUDE.md
+docs/
+Diagrams/
+test-suite/
+tests/
+mlruns/
+data/snapshots/

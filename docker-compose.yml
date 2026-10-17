@@ -18,7 +18,10 @@ x-airflow-common: &airflow-common
     # Immutable raw file. stroke_pipeline.py's train_model task overrides this at
     # runtime to point at the fetched snapshot instead — see that DAG's comments.
     DATA_PATH: /opt/airflow/data/raw/healthcare-dataset-stroke-data.csv
-    DATA_SERVICE_URL: http://api:8000
+    # How the retrain DAG's snapshot differs from the raw file: the share of rows it keeps
+    # and the noise it adds. fetch_data builds it from the raw zone in MinIO.
+    MUTATION_SAMPLE_RATE: "${MUTATION_SAMPLE_RATE:-0.80}"
+    MUTATION_NOISE_STD: "${MUTATION_NOISE_STD:-0.03}"
     # Training registers versions under the same name the model server follows, and the
     # gate's default bar (each DAG run can override it in "Trigger DAG w/ config").
     MODEL_NAME: ${MODEL_NAME}
@@ -30,17 +33,40 @@ x-airflow-common: &airflow-common
     - ./stroke:/opt/airflow/stroke
     - ./data:/opt/airflow/data
     - airflow-logs:/opt/airflow/logs
+  networks: [backend]
   depends_on:
     postgres:
       condition: service_healthy
     mlflow:
       condition: service_healthy
 
+# ─── networks ─────────────────────────────────────────────────────────────────
+# Three networks, so each service reaches only what it needs. The api, the one service
+# facing the internet, is on `scoring` alone: it can reach the model server and nothing
+# else, so even a compromised api can't read MinIO or move an alias in MLflow (which has
+# no authentication of its own here). Only the model server joins `scoring` to `backend`.
+networks:
+  backend: {} # postgres, minio, mlflow, airflow, model-init, model-server, lake-sink
+  scoring: {} # model-server and its clients: api, stream-worker
+  stream: {} # redpanda and its clients: stream-worker, lake-sink
+
+# ─── secrets ──────────────────────────────────────────────────────────────────
+# The TLS files from ./scripts/make_certs.sh, each mounted (read-only, under /run/secrets/)
+# only into the services that use it. Run that script once before the first `up`.
+secrets:
+  grpc-ca:
+    file: ./certs/ca.crt
+  grpc-server-cert:
+    file: ./certs/server.crt
+  grpc-server-key:
+    file: ./certs/server.key
+
 # ─── services ─────────────────────────────────────────────────────────────────
+# Published ports are bound to 127.0.0.1 (this machine only), except the api's.
 services:
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
   postgres:
-    image: postgres:15
+    image: postgres:15.19
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -48,6 +74,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks: [backend]
     healthcheck:
       test:
         ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
@@ -65,9 +92,10 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio-data:/data
+    networks: [backend]
     ports:
-      - "9000:9000" # S3 API
-      - "9001:9001" # MinIO Console
+      - "127.0.0.1:9000:9000" # S3 API
+      - "127.0.0.1:9001:9001" # MinIO Console
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
@@ -87,6 +115,7 @@ services:
       # structure, and a flat key (local/datasets/healthcare-dataset-stroke-data.csv)
       # is what model-init's DATA_PATH and the api's DATASET_KEY both expect.
       - ./data/raw:/data
+    networks: [backend]
     command:
       - -c
       - |
@@ -108,8 +137,9 @@ services:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    networks: [backend]
     ports:
-      - "5001:5000"
+      - "127.0.0.1:5001:5000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -155,7 +185,7 @@ services:
     <<: *airflow-common
     command: webserver
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       airflow-init:
         condition: service_completed_successfully
@@ -178,7 +208,9 @@ services:
 
   # The first champion: trains every candidate (few trials, so the first start stays short)
   # and sends the finalist through the same gate as the DAGs. Exits at once if a champion
-  # already exists. Reads the raw file and its manifest from a read-only mount.
+  # already exists. Reads the raw file and its manifest from a read-only mount. Its image
+  # also holds scripts/, for operator commands that need MLflow and MinIO:
+  #   docker compose run --rm model-init python -m scripts.record_artifact_digests
   model-init:
     build:
       context: .
@@ -192,6 +224,7 @@ services:
       DATA_PATH: /app/data/raw/healthcare-dataset-stroke-data.csv
     volumes:
       - ./data/raw:/app/data/raw:ro
+    networks: [backend]
     command: python -m model.train --skip-if-champion --trials 10
     depends_on:
       mlflow:
@@ -203,6 +236,8 @@ services:
   # ── gRPC model server ───────────────────────────────────────────────────────
   # Holds the champion model and hot-reloads it when the alias moves. The API and the
   # stream worker score through it, so there is one model in memory for every client.
+  # The only service that loads model files, so the only one besides training that holds
+  # the registry and storage credentials. TLS only; every call but health needs a key.
   model-server:
     build:
       context: .
@@ -217,8 +252,15 @@ services:
       RELOAD_INTERVAL_S: "${RELOAD_INTERVAL_S:-10}"
       GRPC_MAX_WORKERS: "${GRPC_MAX_WORKERS:-8}"
       GRPC_MAX_CONCURRENT_RPCS: "${GRPC_MAX_CONCURRENT_RPCS:-32}"
+      # One key per client, so either can be revoked alone
+      MODEL_SERVER_KEYS: "${MODEL_SERVER_KEY_API},${MODEL_SERVER_KEY_WORKER}"
+      TLS_CERT_FILE: /run/secrets/grpc-server-cert
+      TLS_KEY_FILE: /run/secrets/grpc-server-key
+      TLS_CA_FILE: /run/secrets/grpc-ca # for the healthcheck, a client like any other
+    secrets: [grpc-ca, grpc-server-cert, grpc-server-key]
+    networks: [backend, scoring]
     ports:
-      - "50051:50051"
+      - "127.0.0.1:50051:50051" # grpcurl/grpcui from this machine only
     healthcheck:
       # SERVING only once a model is loaded, so the API waits for a usable model server
       test: ["CMD", "python", "-m", "services.model_server.healthcheck"]
@@ -234,6 +276,8 @@ services:
     restart: unless-stopped
 
   # ── FastAPI serving ─────────────────────────────────────────────────────────
+  # The public edge. It holds no data credentials and reaches nothing but the model server
+  # (the `scoring` network): no dataset, no model files, no registry.
   api:
     build:
       context: .
@@ -242,22 +286,18 @@ services:
       # Set: the API scores through the model server. Unset: it loads the model itself.
       MODEL_SERVER_TARGET: model-server:50051
       RPC_TIMEOUT_S: "${RPC_TIMEOUT_S:-2}"
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
-      MODEL_NAME: ${MODEL_NAME}
-      MODEL_ALIAS: ${MODEL_ALIAS}
-      DATASET_BUCKET: datasets
-      DATASET_KEY: healthcare-dataset-stroke-data.csv
-      MUTATION_SAMPLE_RATE: ${MUTATION_SAMPLE_RATE}
-      MUTATION_NOISE_STD: ${MUTATION_NOISE_STD}
-      API_KEYS: ${API_KEYS}
+      UPSTREAM_API_KEY: ${MODEL_SERVER_KEY_API}
+      TLS_CA_FILE: /run/secrets/grpc-ca
+      # Signs and checks the callers' tokens; also the audit log's fingerprint key. Both at
+      # least 32 bytes, or the API refuses to start.
+      JWT_SECRET: ${JWT_SECRET}
+      AUDIT_KEY: ${AUDIT_KEY}
+      RATE_LIMIT_PER_MINUTE: "${RATE_LIMIT_PER_MINUTE:-60}"
+    secrets: [grpc-ca]
+    networks: [scoring]
     ports:
       - "8000:8000"
     depends_on:
-      mlflow:
-        condition: service_healthy
       model-server:
         condition: service_healthy
     restart: unless-stopped
@@ -279,8 +319,12 @@ services:
       - --smp 1
       - --memory 1G
       - --default-log-level=warn
+    networks: [stream]
+    # Both loopbacks: on macOS `localhost` resolves to ::1 first, and kafka-python reaches
+    # the advertised localhost:19092 only through the first address it resolves.
     ports:
-      - "19092:19092"
+      - "127.0.0.1:19092:19092"
+      - "[::1]:19092:19092"
     volumes:
       - redpanda-data:/var/lib/redpanda/data
     healthcheck:
@@ -313,6 +357,7 @@ services:
         create window-reports
         rpk topic alter-config patient-events patient-events-dlq \
           --set retention.ms=3600000 -X brokers=redpanda:9092
+    networks: [stream]
     depends_on:
       redpanda:
         condition: service_healthy
@@ -328,6 +373,10 @@ services:
       MODEL_SERVER_TARGET: model-server:50051
       RPC_TIMEOUT_S: "${RPC_TIMEOUT_S:-2}"
       WINDOW_EVENTS: "${WINDOW_EVENTS:-300}"
+      UPSTREAM_API_KEY: ${MODEL_SERVER_KEY_WORKER}
+      TLS_CA_FILE: /run/secrets/grpc-ca
+    secrets: [grpc-ca]
+    networks: [scoring, stream]
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
@@ -354,6 +403,7 @@ services:
       LAKE_BUCKET: lake
       LAKE_BLOCK_RECORDS: "${LAKE_BLOCK_RECORDS:-1000}"
       LAKE_FLUSH_S: "${LAKE_FLUSH_S:-30}"
+    networks: [stream, backend]
     depends_on:
       redpanda-init:
         condition: service_completed_successfully

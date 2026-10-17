@@ -27,6 +27,7 @@ from kafka import KafkaConsumer, KafkaProducer
 
 from services.stream_worker.events import IntakeEvent, split_events
 from services.stream_worker.windows import Monitor
+from stroke_rpc.channel import ClientTLS, open_channel
 from stroke_rpc.convert import request_from_record
 from stroke_rpc.v1 import scoring_pb2 as pb
 from stroke_rpc.v1 import scoring_pb2_grpc as pb_grpc
@@ -242,7 +243,10 @@ def main() -> None:
     # No (de)serializers: keys and values stay bytes, so a malformed message reaches
     # split_events (and the dead-letter topic) instead of crashing inside poll().
     target = os.getenv("MODEL_SERVER_TARGET", "localhost:50051")
-    channel = grpc.insecure_channel(target)
+    # TLS when TLS_CA_FILE is set, and the worker's own key on every call. Without a valid
+    # key every batch fails with UNAUTHENTICATED: the worker retries rather than dead-letters
+    # those, so the stream stalls until the key is fixed, but no event is lost.
+    channel = open_channel(target, key=os.getenv("UPSTREAM_API_KEY"), tls=ClientTLS.from_env())
     score = make_scorer(pb_grpc.ScoringStub(channel), float(os.getenv("RPC_TIMEOUT_S", "2")))
     monitor = Monitor(baselines, window_events=int(os.getenv("WINDOW_EVENTS", "300")))
 

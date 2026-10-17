@@ -3,10 +3,11 @@ from typing import Any, Protocol
 
 import grpc
 import mlflow
-import mlflow.sklearn
 import pandas as pd
 from mlflow.tracking import MlflowClient
 
+from stroke.registry import load_version
+from stroke_rpc.channel import ClientTLS, open_channel
 from stroke_rpc.convert import request_from_record
 from stroke_rpc.v1 import scoring_pb2 as pb
 from stroke_rpc.v1 import scoring_pb2_grpc as pb_grpc
@@ -45,7 +46,7 @@ class LocalPredictor:
         mlflow.set_tracking_uri(tracking_uri)
         client = MlflowClient(tracking_uri)
         mv = client.get_model_version_by_alias(name, alias)
-        model = mlflow.sklearn.load_model(f"models:/{name}/{mv.version}")
+        model = load_version(name, str(mv.version))  # checked against its artifact_sha256
         info = ModelInfo(
             name=name,
             version=str(mv.version),
@@ -76,17 +77,27 @@ class GrpcPredictor:
     A failed call raises grpc.RpcError; api/main.py maps its status code to an HTTP one.
     """
 
-    def __init__(self, target: str, timeout_s: float) -> None:
+    def __init__(
+        self,
+        target: str,
+        timeout_s: float,
+        key: str | None = None,
+        tls: ClientTLS | None = None,
+    ) -> None:
         # One channel for the whole process: it keeps one connection open and multiplexes
         # every call over it, so opening a channel per request would only add latency.
-        self.channel = grpc.insecure_channel(target)
+        # `key` goes on every call; with `tls` the channel only talks to a server whose
+        # certificate the configured CA signed.
+        self.channel = open_channel(target, key=key, tls=tls)
         self.stub = pb_grpc.ScoringStub(self.channel)
         self.timeout_s = timeout_s  # every call gets a deadline, so none can hang forever
 
     def ready(self) -> bool:
         try:
             self.info()
-        except grpc.RpcError:
+        except grpc.RpcError as exc:
+            if exc.code() in (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED):
+                raise  # our own key was refused: a 502, not "no model loaded"
             return False
         return True
 

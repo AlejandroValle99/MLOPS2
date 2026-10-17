@@ -12,12 +12,12 @@ from collections.abc import Callable
 from typing import Any
 
 import mlflow
-import mlflow.sklearn
 import pandas as pd
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
 from services.model_server.holder import ModelHolder, ModelState
+from stroke.registry import load_version
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +122,8 @@ def mlflow_loader(tracking_uri: str, name: str) -> Loader:
     def load(version: str) -> Any:
         # An explicit version, never models:/name@champion: the alias could move between
         # the lookup above and this load, and then the state would describe the wrong model.
-        return mlflow.sklearn.load_model(f"models:/{name}/{version}")
+        # load_version checks the files against the version's artifact_sha256 tag first, so
+        # a tampered artifact raises here and the reloader keeps the old model ("load-failed").
+        return load_version(name, version)
 
     return load

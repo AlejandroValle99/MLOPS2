@@ -1,10 +1,11 @@
 """Fixtures shared by every test file. Pytest loads this module automatically."""
 
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import grpc
 import mlflow
 import pytest
 from grpc_health.v1 import health
@@ -16,9 +17,14 @@ from services.model_server.holder import ModelHolder, ModelState
 from services.model_server.main import create_server
 from stroke.config import EXPERIMENT_NAME
 from stroke.data import load_clean, split_train_test
+from stroke_rpc.channel import open_channel
 from stroke_rpc.v1 import scoring_pb2_grpc as pb_grpc
 
-CSV = Path(__file__).parent.parent / "data/raw/healthcare-dataset-stroke-data.csv"
+ROOT = Path(__file__).parent.parent
+CSV = ROOT / "data/raw/healthcare-dataset-stroke-data.csv"
+
+# The key the test model server accepts; clients of it send this one.
+UPSTREAM_KEY = "test-upstream-key"
 
 
 @pytest.fixture(scope="session")
@@ -75,23 +81,39 @@ class RunningServer:
     holder: ModelHolder
     health: health.HealthServicer
     target: str
+    key: str  # what a client must send on every call but health
 
 
 @pytest.fixture
 def model_server():
-    """A real gRPC model server on a free local port, started with NO model loaded.
-    Tests put a model in with `model_server.holder.set(make_state())`."""
+    """A real gRPC model server on a free local port (plaintext, keyed with UPSTREAM_KEY),
+    started with NO model loaded. Tests put a model in with
+    `model_server.holder.set(make_state())`."""
     holder = ModelHolder()
-    server, health_servicer, port = create_server(holder, "localhost:0")  # 0: any free port
+    # 0: any free port
+    server, health_servicer, port = create_server(holder, "localhost:0", keys={UPSTREAM_KEY})
     server.start()
-    yield RunningServer(holder, health_servicer, f"localhost:{port}")
+    yield RunningServer(holder, health_servicer, f"localhost:{port}", UPSTREAM_KEY)
     server.stop(None)
 
 
 @pytest.fixture
 def stub(model_server):
-    with grpc.insecure_channel(model_server.target) as channel:
+    with open_channel(model_server.target, key=model_server.key) as channel:
         yield pb_grpc.ScoringStub(channel)
+
+
+@pytest.fixture(scope="session")
+def certs(tmp_path_factory) -> Path:
+    """A dev CA, a server certificate for localhost and a client certificate, made by the
+    project's own scripts/make_certs.sh in a temporary folder (never in certs/)."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not installed")
+    out = tmp_path_factory.mktemp("certs")
+    subprocess.run(
+        ["bash", str(ROOT / "scripts/make_certs.sh"), str(out)], check=True, capture_output=True
+    )
+    return out
 
 
 @pytest.fixture(scope="session")

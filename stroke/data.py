@@ -119,6 +119,32 @@ def exclude_frozen_test(snapshot: pd.DataFrame, raw_csv: Path) -> pd.DataFrame:
     return snapshot[~snapshot["id"].isin(raw_ids.loc[X_test.index])]
 
 
+# Clipping bounds for the noise apply_mutations adds, so a value never leaves its range.
+_NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
+    "age": (0.0, 100.0),
+    "avg_glucose_level": (50.0, 300.0),
+    "bmi": (10.0, 70.0),
+}
+
+
+def apply_mutations(
+    df: pd.DataFrame, sample_rate: float = 0.80, noise_std: float = 0.03
+) -> pd.DataFrame:
+    """A stand-in for newly collected data: a random `sample_rate` of the raw rows, with
+    Gaussian noise of `noise_std` standard deviations on each numeric feature. The retrain
+    DAG builds its snapshot with it. Keeps the `id` column, so exclude_frozen_test can still
+    drop every frozen test patient."""
+    df = df.sample(frac=sample_rate).copy()
+
+    for col, (low, high) in _NUMERIC_BOUNDS.items():
+        noise = np.random.normal(0, noise_std * df[col].std(), size=len(df))
+        df[col] = (df[col] + noise).clip(low, high)
+
+    df["bmi"] = df["bmi"].fillna(df["bmi"].median())
+
+    return df.sample(frac=1).reset_index(drop=True)
+
+
 def snapshot_data(snapshot_csv: Path, raw_csv: Path) -> TrainingData:
     """Train on a fresh snapshot, test on the raw file's frozen test set. The model is then
     judged on the same rows as every other version, none of which it trained on."""

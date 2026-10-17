@@ -12,7 +12,7 @@ from services.model_server.main import WARMUP_ROW
 
 @pytest.fixture
 def predictor(model_server):
-    p = GrpcPredictor(model_server.target, timeout_s=2)
+    p = GrpcPredictor(model_server.target, timeout_s=2, key=model_server.key)
     yield p
     p.close()
 
