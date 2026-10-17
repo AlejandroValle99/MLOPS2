@@ -3,9 +3,11 @@
     verify_raw -> fetch_data -> validate_data -> train_model
 
 The snapshot stands in for newly collected data: the same patients resampled, with noise.
-train_model trains every candidate on it, minus the frozen test patients, and gates the
-finalist against the champion on the frozen test set from the raw file. So a retrained
-model is judged on the same rows as every other version, none of which it trained on.
+fetch_data builds it from the lake's raw zone (the `datasets` bucket in MinIO), after
+checking that copy against the raw file's manifest. train_model trains every candidate on
+it, minus the frozen test patients, and gates the finalist against the champion on the
+frozen test set from the raw file. So a retrained model is judged on the same rows as
+every other version, none of which it trained on.
 """
 
 import os
@@ -18,8 +20,6 @@ from airflow.operators.python import PythonOperator
 
 from stroke.config import GATE_MIN_P_BETTER
 
-DATA_SERVICE_URL = os.getenv("DATA_SERVICE_URL", "http://api:8000")
-
 # fetch_data used to write the mutated /dataset response over this same path, which is
 # the bind-mounted RAW source file. minio-init re-uploaded that mutated copy on every
 # restart, so the dataset shrank 5,110 -> 4,088 -> 3,270 -> 2,616 -> 2,093 rows across
@@ -30,6 +30,10 @@ RAW_DATA_PATH = os.getenv(
     "RAW_DATA_PATH", "/opt/airflow/data/raw/healthcare-dataset-stroke-data.csv"
 )
 SNAPSHOT_PATH = os.getenv("SNAPSHOT_PATH", "/opt/airflow/data/snapshots/stroke_snapshot.csv")
+
+# The raw zone: minio-init uploads the raw file there, next to its manifest.
+DATASET_BUCKET = os.getenv("DATASET_BUCKET", "datasets")
+DATASET_KEY = os.getenv("DATASET_KEY", "healthcare-dataset-stroke-data.csv")
 
 default_args = {
     "owner": "mlops-fiuba",
@@ -46,23 +50,48 @@ def verify_raw() -> str:
 
 
 def fetch_data() -> None:
-    """Downloads a fresh dataset snapshot from the API into SNAPSHOT_PATH.
+    """Builds a fresh snapshot from the raw zone in MinIO and writes it to SNAPSHOT_PATH.
 
-    Never writes to RAW_DATA_PATH — see the note above the module-level constants.
+    The copy in MinIO must match the raw file's manifest, so a dataset edited in the bucket
+    fails here instead of reaching training. Never writes to RAW_DATA_PATH (see the note
+    above the module-level constants). This used to download the API's /dataset route,
+    which served every patient record on the public port; Airflow already holds the MinIO
+    credentials, so it reads the bucket itself and the API holds none.
     """
-    import urllib.request
+    import hashlib
+    import io
+    import json
 
+    import boto3
+    import pandas as pd
+    from botocore.client import Config
+
+    from stroke.data import MANIFEST_NAME, apply_mutations
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.environ["MLFLOW_S3_ENDPOINT_URL"],  # credentials: AWS_* variables
+        config=Config(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
+    content = s3.get_object(Bucket=DATASET_BUCKET, Key=DATASET_KEY)["Body"].read()
+    manifest = json.loads((Path(RAW_DATA_PATH).parent / MANIFEST_NAME).read_text())
+    actual = hashlib.sha256(content).hexdigest()
+    if actual != manifest["sha256"]:
+        raise ValueError(
+            f"s3://{DATASET_BUCKET}/{DATASET_KEY} doesn't match the raw file's manifest "
+            f"(expected {manifest['sha256'][:12]}, got {actual[:12]})"
+        )
+
+    snapshot = apply_mutations(
+        pd.read_csv(io.BytesIO(content)),
+        sample_rate=float(os.getenv("MUTATION_SAMPLE_RATE", "0.80")),
+        noise_std=float(os.getenv("MUTATION_NOISE_STD", "0.03")),
+    )
     snapshot_path = Path(SNAPSHOT_PATH)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    url = f"{DATA_SERVICE_URL}/dataset"
-
-    with urllib.request.urlopen(url) as response:
-        if response.status != 200:
-            raise RuntimeError(f"/dataset returned HTTP {response.status}")
-        content = response.read()
-
-    snapshot_path.write_bytes(content)
-    print(f"Dataset escrito en {snapshot_path} ({len(content)} bytes)")
+    snapshot.to_csv(snapshot_path, index=False)
+    print(f"Snapshot escrito en {snapshot_path} ({len(snapshot)} filas)")
 
 
 def validate_data() -> None:

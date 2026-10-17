@@ -1,9 +1,12 @@
-"""FastAPI app — stroke prediction service."""
+"""FastAPI app — stroke prediction service.
 
-import io
+The API is the service's public edge, and it holds no data: no dataset, no model files,
+no storage credentials. It checks who is calling (api/security.py), validates the request
+(api/schemas.py), and asks the model server for the score over gRPC.
+"""
+
 import logging
 import os
-import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -11,12 +14,20 @@ from uuid import uuid4
 
 import grpc
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.security import APIKeyHeader
+from fastapi.responses import JSONResponse
 
-from api.data import apply_mutations, fetch_dataset
 from api.predictor import GrpcPredictor, LocalPredictor, ModelInfo, Predictor
 from api.schemas import StrokeInput, StrokePrediction
+from api.security import (
+    BodySizeLimit,
+    RateLimiter,
+    audit_key,
+    jwt_secret,
+    rate_limited,
+    require_role,
+)
+from stroke.audit import audit_event, input_fingerprint
+from stroke_rpc.channel import ClientTLS
 
 log = logging.getLogger(__name__)
 
@@ -37,26 +48,32 @@ GRPC_TO_HTTP = {
     grpc.StatusCode.PERMISSION_DENIED: 502,
 }
 
-_api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=False)
+# A /v1/predict body is a few hundred bytes; nothing the API accepts comes near this.
+MAX_BODY_BYTES = 16 * 1024
 
-
-def require_api_key(key: Annotated[str | None, Depends(_api_key_header)]) -> str:
-    allowed = [k for k in os.getenv("API_KEYS", "").split(",") if k]
-    if key is None or not any(secrets.compare_digest(key, k) for k in allowed):
-        raise HTTPException(status_code=401, detail="missing or invalid API key")
-    return key
-
-
-ApiKeyDep = Annotated[str, Depends(require_api_key)]
+# Who called, already checked: the token's claims (sub, role, ...)
+PredictCaller = Annotated[dict, Depends(rate_limited)]
+Admin = Annotated[dict, Depends(require_role("admin"))]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    # The audit lines are INFO records on the `audit` logger; uvicorn configures only its own.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # Refuse to start with a missing or short secret, rather than fail on the first call
+    jwt_secret()
+    audit_key()
     predictor: Predictor
     target = os.getenv("MODEL_SERVER_TARGET")
     if target:
-        # The model lives in the gRPC model server, which also hot-reloads it.
-        predictor = GrpcPredictor(target, float(os.getenv("RPC_TIMEOUT_S", "2")))
+        # The model lives in the gRPC model server, which also hot-reloads it. Every call
+        # carries the API's own key, over TLS when TLS_CA_FILE is set.
+        predictor = GrpcPredictor(
+            target,
+            float(os.getenv("RPC_TIMEOUT_S", "2")),
+            key=os.getenv("UPSTREAM_API_KEY"),
+            tls=ClientTLS.from_env(),
+        )
     else:
         # No model server configured: load the champion into this process, once.
         try:
@@ -78,6 +95,8 @@ PredictorDep = Annotated[Predictor, Depends(get_predictor)]
 
 
 app = FastAPI(title="Stroke Prediction API", version="0.1.0", lifespan=lifespan)
+app.add_middleware(BodySizeLimit, max_bytes=MAX_BODY_BYTES)
+app.state.rate_limiter = RateLimiter(int(os.getenv("RATE_LIMIT_PER_MINUTE", "60")))
 
 
 @app.exception_handler(grpc.RpcError)
@@ -93,48 +112,33 @@ async def grpc_error(request: Request, exc: grpc.RpcError) -> JSONResponse:
 v1 = APIRouter(prefix="/v1")
 
 
-# @app.get("/model-info")
-# def model_info() -> dict:
-#     try:
-#         client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-
-#         model = client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
-
-#         run = client.get_run(model.run_id)
-
-#         return {
-#             "model_name": MODEL_NAME,
-#             "model_alias": MODEL_ALIAS,
-#             "model_version": model.version,
-#             "model_run_id": model.run_id,
-#             "test_f2": run.data.metrics.get("test_f2"),
-#             "test_recall": run.data.metrics.get("test_recall"),
-#             "test_precision": run.data.metrics.get("test_precision"),
-#             "test_roc_auc": run.data.metrics.get("test_roc_auc"),
-#         }
-
-#     except Exception as exc:
-#         raise HTTPException(
-#             status_code=500, detail=f"Error al obtener información del modelo: {exc}"
-#         ) from exc
-
-
 @v1.post("/predict")
 def predict(
     body: StrokeInput,
     predictor: PredictorDep,
-    _key: ApiKeyDep,
-    x_request_id: Annotated[str | None, Header()] = None,
+    caller: PredictCaller,
+    x_request_id: Annotated[str | None, Header(max_length=64)] = None,
 ) -> StrokePrediction:
     if not predictor.ready():
         raise HTTPException(status_code=503, detail="no model loaded")
     request_id = x_request_id or uuid4().hex
 
-    scored = predictor.predict(body.to_model_row(), request_id)
+    row = body.to_model_row()
+    scored = predictor.predict(row, request_id)
+    high_risk = scored.probability >= scored.info.threshold
+    audit_event(
+        caller["sub"],
+        "predict",
+        request_id=request_id,
+        patient_id=body.patient_id,  # the hospital's pseudonym, or None
+        input=input_fingerprint(row, audit_key()),  # never the features themselves
+        model_version=scored.info.version,
+        high_risk=high_risk,
+    )
     return StrokePrediction(
         request_id=request_id,
         probability=scored.probability,
-        high_risk=scored.probability >= scored.info.threshold,
+        high_risk=high_risk,
         threshold=scored.info.threshold,
         model_name=scored.info.name,
         model_version=scored.info.version,
@@ -143,32 +147,14 @@ def predict(
 
 
 @v1.get("/model")
-def model(predictor: PredictorDep, _key: ApiKeyDep) -> ModelInfo:
+def model(predictor: PredictorDep, _admin: Admin) -> ModelInfo:
+    """The served model's details (family, data version, threshold): for operators only."""
     if not predictor.ready():
         raise HTTPException(status_code=503, detail="no model loaded")
     return predictor.info()
 
 
 app.include_router(v1)
-
-
-@app.get("/dataset")
-def dataset() -> StreamingResponse:
-    try:
-        df = fetch_dataset()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503, detail=f"Could not fetch dataset from MinIO: {exc}"
-        ) from exc
-    df = apply_mutations(df)
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    buf.seek(0)
-    return StreamingResponse(
-        iter([buf.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=dataset.csv"},
-    )
 
 
 @app.get("/health")

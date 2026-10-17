@@ -1,15 +1,23 @@
-"""stroke.registry: the gate, promotion and rollback against a real (sqlite) MLflow, and what
-the model server's reloader sees after each of them."""
+"""stroke.registry: the gate, promotion and rollback against a real (sqlite) MLflow, the
+artifact digest checked before every load, the audit lines, and what the model server's
+reloader sees after each of them."""
 
+import json
+import logging
 import uuid
+from pathlib import Path
+from urllib.parse import urlparse
 
 import mlflow
+import numpy as np
+import pandas as pd
 import pytest
 from mlflow.tracking import MlflowClient
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
+from skops.io import dumps
 
 from model.preprocess import build_feature_pipeline
 from services.model_server.holder import ModelHolder
@@ -17,9 +25,14 @@ from services.model_server.main import WARMUP_ROW
 from services.model_server.reloader import Reloader, mlflow_loader, mlflow_lookup
 from stroke.config import CHAMPION, PREVIOUS_CHAMPION
 from stroke.registry import (
+    DIGEST_TAG,
+    ArtifactIntegrityError,
+    digest_of,
     get_alias,
+    load_version,
     log_candidate,
     promote,
+    record_missing_digests,
     register,
     rollback,
     run_gate,
@@ -48,7 +61,7 @@ def new_version(name, tiny_model, split):
 
     def make(threshold: float, test_split: str = SPLIT, model=None) -> str:
         use_experiment()
-        _, uri = log_candidate(
+        logged = log_candidate(
             "logreg",
             tiny_model if model is None else model,
             params={},
@@ -59,7 +72,8 @@ def new_version(name, tiny_model, split):
             pip_requirements=[],  # skip MLflow's requirement inference: ~2 s per model
         )
         finalist = {
-            "model_uri": uri,
+            "model_uri": logged.model_uri,
+            "artifact_sha256": logged.artifact_sha256,
             "threshold": threshold,
             "model_family": "logreg",
             "data_version": "abc123",
@@ -168,6 +182,21 @@ def test_rollback_restores_the_previous_champion_with_its_threshold(
         rollback(client, name)
 
 
+def test_a_rollback_says_who_asked_on_the_version_and_in_the_audit_log(
+    client, name, new_version, gate, caplog
+):
+    old = new_version(threshold=0.3)
+    gate(old)
+    new = new_version(threshold=0.7)
+    gate(new, min_p_better=0.0)
+    caplog.set_level(logging.INFO, logger="audit")
+    rollback(client, name, actor="ops-1")
+    assert client.get_model_version(name, new).tags["rolled_back_by"] == "ops-1"
+    (line,) = audit_lines(caplog)
+    assert (line["actor"], line["action"]) == ("ops-1", "rollback")
+    assert (line["from_version"], line["to_version"]) == (new, old)
+
+
 def test_rollback_without_a_previous_champion_fails(client, name, new_version, gate):
     gate(new_version(threshold=0.5))
     with pytest.raises(LookupError):
@@ -251,3 +280,129 @@ def test_a_model_with_a_type_serving_cannot_load_is_refused_before_it_is_logged(
     model.fit(X_train[["age"]], y_train)
     with pytest.raises(ValueError, match="Doubler"):
         trusted_types_for(model)
+
+
+# --- the audit log ---------------------------------------------------------------------------
+
+
+def audit_lines(caplog) -> list[dict]:
+    return [json.loads(r.getMessage()) for r in caplog.records if r.name == "audit"]
+
+
+def test_every_gate_decision_leaves_one_audit_line(client, name, new_version, gate, caplog):
+    caplog.set_level(logging.INFO, logger="audit")
+    champion = new_version(threshold=0.5)
+    gate(champion)
+    weaker = new_version(threshold=0.99)
+    gate(weaker)
+    promoted, rejected = audit_lines(caplog)
+    assert (promoted["actor"], promoted["action"], promoted["version"]) == (
+        "gate",
+        "promote",
+        champion,
+    )
+    assert (rejected["action"], rejected["version"], rejected["champion"]) == (
+        "reject",
+        weaker,
+        champion,
+    )
+    assert rejected["p_better"] < 0.05 and rejected["reason"]
+
+
+# --- the artifact digest ---------------------------------------------------------------------
+
+
+def artifact_dir(client: MlflowClient, name: str, version: str) -> Path:
+    """Where the version's files really are: here a folder, in compose a MinIO prefix."""
+    model_id = client.get_model_version(name, version).source.rsplit("/", 1)[-1]
+    return Path(urlparse(client.get_logged_model(model_id).artifact_location).path)
+
+
+def test_the_digest_taken_at_logging_is_the_registered_versions(client, name, new_version):
+    version = new_version(threshold=0.5)
+    recorded = client.get_model_version(name, version).tags[DIGEST_TAG]
+    assert len(recorded) == 64
+    # A download of the version holds one more file than was logged (registered_model_meta,
+    # which names the version); the digest leaves it out, so the two still agree.
+    assert digest_of(f"models:/{name}/{version}") == recorded
+
+
+def test_a_verified_version_loads_and_scores(name, new_version, tiny_model):
+    version = new_version(threshold=0.5)
+    frame = pd.DataFrame([WARMUP_ROW])
+    loaded = load_version(name, version)
+    assert np.array_equal(loaded.predict_proba(frame), tiny_model.predict_proba(frame))
+
+
+def test_a_swapped_model_file_is_refused_and_the_old_model_keeps_serving(
+    client, name, new_version, gate, mlflow_store, tiny_model, split
+):
+    X_train, _, y_train, _ = split
+    first = new_version(threshold=0.5)
+    gate(first)
+    holder = ModelHolder()
+    reloader = Reloader(
+        holder,
+        name,
+        lookup=mlflow_lookup(mlflow_store, name, CHAMPION),
+        loader=mlflow_loader(mlflow_store, name),
+        warmup_row=WARMUP_ROW,
+        interval_s=1,
+    )
+    assert reloader.check_once() == "loaded"
+
+    second = new_version(threshold=0.5)
+    gate(second, min_p_better=0.0)
+    # The attack: a different, working model in place of the registered one. Same classes,
+    # so it would load and score without complaint; here it is trained on inverted labels.
+    impostor = clone(tiny_model).fit(X_train, 1 - y_train)
+    (artifact_dir(client, name, second) / "model.skops").write_bytes(dumps(impostor))
+    unchecked = mlflow.sklearn.load_model(f"models:/{name}/{second}")
+    assert unchecked.predict_proba(pd.DataFrame([WARMUP_ROW]))[0, 1] < 0.5  # it would serve
+
+    with pytest.raises(ArtifactIntegrityError, match="changed since registration"):
+        load_version(name, second)
+    assert reloader.check_once() == "load-failed"
+    state = holder.get()
+    assert state is not None and state.version == first  # still the verified model
+
+
+def test_an_edited_mlmodel_is_refused_too(client, name, new_version):
+    """MLmodel lists the types skops will trust: editing it is tampering as well."""
+    version = new_version(threshold=0.5)
+    mlmodel = artifact_dir(client, name, version) / "MLmodel"
+    mlmodel.write_text(mlmodel.read_text() + "\n# edited\n")
+    with pytest.raises(ArtifactIntegrityError):
+        load_version(name, version)
+
+
+def legacy_version(name: str) -> str:
+    """A version registered the way the old trainer did: no digest, no serving tags."""
+    use_experiment()
+    with mlflow.start_run():
+        info = mlflow.sklearn.log_model(
+            Pipeline([("model", LogisticRegression())]), name="model", pip_requirements=[]
+        )
+    return str(mlflow.register_model(info.model_uri, name).version)
+
+
+def test_a_version_without_a_digest_is_refused(name):
+    version = legacy_version(name)
+    with pytest.raises(ArtifactIntegrityError, match="no artifact_sha256"):
+        load_version(name, version)
+
+
+def test_the_backfill_records_a_digest_only_where_one_is_missing(client, name, new_version, caplog):
+    current = new_version(threshold=0.5)
+    before = client.get_model_version(name, current).tags[DIGEST_TAG]
+    old = legacy_version(name)
+    caplog.set_level(logging.INFO, logger="audit")
+
+    assert record_missing_digests(client, name, actor="ops-1") == [old]
+    assert client.get_model_version(name, old).tags[DIGEST_TAG] == digest_of(
+        f"models:/{name}/{old}"
+    )
+    assert client.get_model_version(name, current).tags[DIGEST_TAG] == before  # untouched
+    (line,) = audit_lines(caplog)
+    assert (line["actor"], line["action"], line["version"]) == ("ops-1", "record-digest", old)
+    assert record_missing_digests(client, name, actor="ops-1") == []  # nothing left to do

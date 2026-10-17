@@ -5,8 +5,12 @@
 Only aliases move: nothing is retrained or deleted, and no model files are read, so the
 registry is all this needs. The model server follows the alias and serves the restored
 version, with that version's own threshold, within one reload interval. `previous_champion`
-is used up by the rollback, so running this twice in a row fails the second time.
+is used up by the rollback, so running this twice in a row fails the second time. Who ran
+it (the login name) is tagged on the rolled-back version and written to the audit log.
 """
+
+import getpass
+import logging
 
 from mlflow.tracking import MlflowClient
 
@@ -15,8 +19,9 @@ from stroke.registry import rollback
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     client = MlflowClient()  # MLFLOW_TRACKING_URI from the environment
-    version = rollback(client, MODEL_NAME)
+    version = rollback(client, MODEL_NAME, actor=f"{getpass.getuser()} (rollback script)")
     tags = client.get_model_version(MODEL_NAME, version).tags
     print(
         f"{MODEL_NAME}: champion is version {version} again "

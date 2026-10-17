@@ -1,21 +1,35 @@
-"""The REST API: the request contract, routes, API key, liveness vs readiness, and parity
-with the offline model. No MLflow needed: the predictor is swapped for one holding
-the `tiny_model` fixture (tests/conftest.py) through FastAPI's dependency_overrides.
+"""The REST API: the request contract, routes, tokens and roles, rate and size limits, the
+audit line, liveness vs readiness, and parity with the offline model. No MLflow needed:
+the predictor is swapped for one holding the `tiny_model` fixture (tests/conftest.py)
+through FastAPI's dependency_overrides.
 """
 
+import json
+import logging
 import time
 from dataclasses import replace
 
 import grpc
+import jwt
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app, get_predictor
 from api.predictor import GrpcPredictor, LocalPredictor, ModelInfo, Predictor
+from api.security import RateLimiter, issue_token
 from scripts.mini_tp1_client import EXPECTED, VALID, run
 
-KEY = {"X-API-KEY": "test-key"}
+SECRET = "test-jwt-secret-that-is-long-enough-for-hs256"
+AUDIT = "test-audit-key-that-is-long-enough-for-hmac"
+
+
+def bearer(role: str = "predict", subject: str = "clinician-1", **kwargs) -> dict:
+    return {"Authorization": f"Bearer {issue_token(subject, role, secret=SECRET, **kwargs)}"}
+
+
+KEY = bearer("predict")  # a clinician
+ADMIN = bearer("admin", "ops-1")
 INFO = ModelInfo(
     name="stroke-model", version="7", threshold=0.5, family="logreg", data_version="abc123"
 )
@@ -28,10 +42,17 @@ def serve(predictor: Predictor) -> None:
 
 @pytest.fixture
 def client(tiny_model, monkeypatch):
-    monkeypatch.setenv("API_KEYS", "test-key,second-key")
+    monkeypatch.setenv("JWT_SECRET", SECRET)
+    monkeypatch.setenv("AUDIT_KEY", AUDIT)
+    # A fresh limiter per test, high enough that only the rate-limit tests ever reach it
+    monkeypatch.setattr(app.state, "rate_limiter", RateLimiter(per_minute=10_000))
     serve(LocalPredictor(tiny_model, INFO))
     yield TestClient(app)  # no `with`: the lifespan (and so MLflow) never runs
     app.dependency_overrides.clear()
+
+
+def audit_lines(caplog) -> list[dict]:
+    return [json.loads(r.getMessage()) for r in caplog.records if r.name == "audit"]
 
 
 def as_request_body(row: dict) -> dict:
@@ -83,17 +104,132 @@ def test_patient_id_is_accepted_but_is_not_a_model_feature(client):
     assert r.status_code == 200
 
 
-# --- the API key --------------------------------------------------------------------------
+# --- tokens and roles: 401 is "who are you?", 403 is "not you" --------------------------
 
 
-@pytest.mark.parametrize("headers", [{}, {"X-API-KEY": "wrong"}], ids=["missing", "wrong"])
-def test_missing_or_wrong_api_key_is_401(client, headers):
-    assert client.post("/v1/predict", json=VALID, headers=headers).status_code == 401
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"Authorization": "Bearer not-a-jwt"},
+        {"Authorization": "Basic dXNlcjpwYXNz"},
+        {"Authorization": f"Bearer {issue_token('x', 'predict', secret='another-secret' * 4)}"},
+    ],
+    ids=["missing", "garbage", "wrong-scheme", "wrong-signature"],
+)
+def test_a_missing_or_invalid_token_is_401(client, headers):
+    r = client.post("/v1/predict", json=VALID, headers=headers)
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == "Bearer"
 
 
-def test_every_configured_api_key_is_accepted(client):
-    r = client.post("/v1/predict", json=VALID, headers={"X-API-KEY": "second-key"})
-    assert r.status_code == 200
+def test_an_expired_token_is_401(client):
+    r = client.post("/v1/predict", json=VALID, headers=bearer(minutes=-1))
+    assert r.status_code == 401
+    assert r.json()["detail"] == "token expired"
+
+
+def test_a_token_for_another_audience_is_401(client):
+    forged = jwt.encode(
+        {"sub": "x", "role": "admin", "iat": time.time(), "exp": time.time() + 60}, SECRET
+    )  # signed with the right secret, but no issuer or audience: not one of ours
+    r = client.get("/v1/model", headers={"Authorization": f"Bearer {forged}"})
+    assert r.status_code == 401
+
+
+def test_an_unsigned_token_is_401(client):
+    claims = {"sub": "x", "role": "admin", "iss": "stroke-risk", "aud": "stroke-api"}
+    claims |= {"iat": time.time(), "exp": time.time() + 60}
+    unsigned = jwt.encode(claims, None, algorithm="none")  # "alg": "none", no signature
+    r = client.get("/v1/model", headers={"Authorization": f"Bearer {unsigned}"})
+    assert r.status_code == 401
+
+
+def test_both_roles_may_predict(client):
+    assert client.post("/v1/predict", json=VALID, headers=KEY).status_code == 200
+    assert client.post("/v1/predict", json=VALID, headers=ADMIN).status_code == 200
+
+
+def test_the_predict_role_cannot_read_the_model_details(client):
+    r = client.get("/v1/model", headers=KEY)
+    assert r.status_code == 403
+    assert client.get("/v1/model", headers=ADMIN).status_code == 200
+
+
+def test_the_api_refuses_a_short_secret(client, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "change_me_to_32_bytes_or_more")  # 29 bytes
+    with pytest.raises(RuntimeError, match="at least 32 bytes"):
+        with TestClient(app):  # runs the lifespan, which checks the secrets first
+            pass
+
+
+# --- rate and size limits --------------------------------------------------------------------
+
+
+def test_the_call_over_the_rate_limit_is_429(client, monkeypatch):
+    monkeypatch.setattr(app.state, "rate_limiter", RateLimiter(per_minute=3))
+    statuses = [client.post("/v1/predict", json=VALID, headers=KEY).status_code for _ in range(4)]
+    assert statuses == [200, 200, 200, 429]
+    r = client.post("/v1/predict", json=VALID, headers=KEY)
+    assert 0 < int(r.headers["retry-after"]) <= 60
+    # The limit is per caller: another clinician still gets through
+    other = bearer(subject="clinician-2")
+    assert client.post("/v1/predict", json=VALID, headers=other).status_code == 200
+
+
+def test_an_oversized_body_is_413_before_it_is_read(client):
+    huge = {**VALID, "patient_id": "x" * 20_000}
+    assert client.post("/v1/predict", json=huge, headers=KEY).status_code == 413
+
+
+def test_the_dataset_route_is_gone(client):
+    assert client.get("/dataset").status_code == 404
+
+
+# --- the audit log -------------------------------------------------------------------------------
+
+
+def test_every_prediction_leaves_one_audit_line_without_features(client, caplog):
+    caplog.set_level(logging.INFO, logger="audit")
+    body = {**VALID, "patient_id": "p-001"}
+    r = client.post("/v1/predict", json=body, headers={**KEY, "x-request-id": "req-7"})
+    (line,) = audit_lines(caplog)
+    assert line["actor"] == "clinician-1"
+    assert line["action"] == "predict"
+    assert (line["request_id"], line["patient_id"]) == ("req-7", "p-001")
+    assert line["model_version"] == "7"
+    assert line["high_risk"] == r.json()["high_risk"]
+    assert len(line["input"]) == 32  # a keyed fingerprint of the features...
+    for feature, value in VALID.items():  # ...and none of the features themselves
+        assert feature not in line
+        if isinstance(value, float):
+            assert str(value) not in json.dumps(line)
+
+
+def test_refused_calls_are_audited(client, caplog, monkeypatch):
+    caplog.set_level(logging.INFO, logger="audit")
+    client.post("/v1/predict", json=VALID)
+    client.get("/v1/model", headers=KEY)
+    monkeypatch.setattr(app.state, "rate_limiter", RateLimiter(per_minute=0))
+    client.post("/v1/predict", json=VALID, headers=KEY)
+    actions = [(line["actor"], line["action"]) for line in audit_lines(caplog)]
+    assert actions == [
+        ("anonymous", "auth-denied"),
+        ("clinician-1", "forbidden"),
+        ("clinician-1", "rate-limited"),
+    ]
+
+
+def test_no_log_line_holds_a_feature_value(client, via_grpc, caplog):
+    """Through the whole path (REST, gRPC, the model server), at every log level."""
+    caplog.set_level(logging.DEBUG)
+    distinctive = {**VALID, "avg_glucose_level": 213.37, "bmi": 31.41, "age": 71.5}
+    assert client.post("/v1/predict", json=distinctive, headers=KEY).status_code == 200
+    too_old = {**distinctive, "age": 130}
+    assert client.post("/v1/predict", json=too_old, headers=KEY).status_code == 422
+    assert caplog.records  # something was logged
+    for value in ("213.37", "31.41", "71.5"):
+        assert value not in caplog.text
 
 
 # --- the contract rejects bad input with a 422 that names the field ----------------------
@@ -151,7 +287,7 @@ def test_ready_reports_the_loaded_version(client):
 
 
 def test_model_route_returns_the_model_info(client):
-    r = client.get("/v1/model", headers=KEY)
+    r = client.get("/v1/model", headers=ADMIN)
     assert r.status_code == 200
     assert r.json() == {
         "name": "stroke-model",
@@ -164,7 +300,7 @@ def test_model_route_returns_the_model_info(client):
 
 def test_model_route_is_503_without_a_model(client):
     serve(LocalPredictor())
-    assert client.get("/v1/model", headers=KEY).status_code == 503
+    assert client.get("/v1/model", headers=ADMIN).status_code == 503
 
 
 # --- golden parity: the API must score exactly like the model offline ---------------------
@@ -184,7 +320,7 @@ def test_api_probability_matches_offline_predict_proba(client, tiny_model, split
 
 
 def test_mini_tp1_client_shows_200_then_422_then_401(client):
-    client.headers.update(KEY)  # the script's own main() sets this from API_KEY
+    client.headers.update(KEY)  # the script's own main() sets this from API_TOKEN
     assert run(client) == EXPECTED
 
 
@@ -228,7 +364,7 @@ class FailingPredictor(LocalPredictor):
 def via_grpc(client, model_server, make_state):
     """The API wired to a real local model server, which starts out holding version 1."""
     model_server.holder.set(make_state(version="1"))
-    predictor = GrpcPredictor(model_server.target, timeout_s=2)
+    predictor = GrpcPredictor(model_server.target, timeout_s=2, key=model_server.key)
     serve(predictor)
     yield model_server
     predictor.close()
@@ -252,11 +388,21 @@ def test_through_grpc_the_response_shows_the_version_that_scored_it(client, via_
 
 def test_through_grpc_ready_and_model_route_ask_the_model_server(client, via_grpc):
     assert client.get("/ready").json()["model_version"] == "1"
-    assert client.get("/v1/model", headers=KEY).json()["data_version"] == "abc123"
+    assert client.get("/v1/model", headers=ADMIN).json()["data_version"] == "abc123"
+
+
+def test_a_wrong_upstream_key_is_502_not_401(client, model_server, make_state):
+    """The model server refusing the API's own key is our fault, not the caller's."""
+    model_server.holder.set(make_state())
+    predictor = GrpcPredictor(model_server.target, timeout_s=2, key="not-the-key")
+    serve(predictor)
+    r = client.post("/v1/predict", json=VALID, headers=KEY)
+    assert r.status_code == 502
+    predictor.close()
 
 
 def test_through_grpc_a_model_server_without_a_model_is_503(client, model_server):
-    predictor = GrpcPredictor(model_server.target, timeout_s=2)
+    predictor = GrpcPredictor(model_server.target, timeout_s=2, key=model_server.key)
     serve(predictor)
     assert client.get("/ready").status_code == 503
     assert client.post("/v1/predict", json=VALID, headers=KEY).status_code == 503
@@ -273,7 +419,7 @@ def test_a_model_server_that_is_down_is_503(client):
 
 def test_a_slow_model_server_is_504(client, model_server, make_state, tiny_model):
     model_server.holder.set(make_state(model=SlowModel(tiny_model)))
-    predictor = GrpcPredictor(model_server.target, timeout_s=0.2)
+    predictor = GrpcPredictor(model_server.target, timeout_s=0.2, key=model_server.key)
     serve(predictor)
     r = client.post("/v1/predict", json=VALID, headers=KEY)
     assert r.status_code == 504

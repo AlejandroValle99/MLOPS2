@@ -153,9 +153,14 @@ def test_the_cli_trains_and_gates_then_skips_once_a_champion_exists(
     train.main([*args, "--skip-if-champion"])  # nothing serves yet: trains anyway
     result = json.loads(capsys.readouterr().out)
     assert (result["decision"], result["reason"]) == ("promoted", "no champion yet")
-    champion = MlflowClient(mlflow_store).get_model_version_by_alias(name, CHAMPION)
+    client = MlflowClient(mlflow_store)
+    champion = client.get_model_version_by_alias(name, CHAMPION)
     assert champion.tags["model_family"] == result["model_family"]
     assert 0 < float(champion.tags["threshold"]) < 1
+    assert len(champion.tags["artifact_sha256"]) == 64
+    card = mlflow.artifacts.load_dict(f"runs:/{champion.run_id}/model_card.json")
+    assert card["model"] == f"{name} v{champion.version}"
+    assert card["gate"]["decision"] == "promoted"
 
     train.main([*args, "--skip-if-champion"])  # compose's model-init on a later start
     assert capsys.readouterr().out == ""

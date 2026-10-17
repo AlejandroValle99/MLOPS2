@@ -3,10 +3,10 @@
 import pandas as pd
 import pytest
 
-from api.data import apply_mutations
 from model.preprocess import RAW_COLUMNS
 from stroke.data import (
     HOSPITALS,
+    apply_mutations,
     assign_hospital,
     data_version,
     exclude_frozen_test,

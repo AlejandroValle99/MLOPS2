@@ -1,11 +1,12 @@
 """Mini-TP 1 client: one valid and one invalid prediction against the running API.
 
-With the API up on localhost:8000 (compose, or uvicorn locally):
+With the API up on localhost:8000 (compose, or uvicorn locally), and a token with the
+`predict` role (python -m api.security <subject> predict, where JWT_SECRET is set):
 
-    API_KEY=<one of the API's API_KEYS> uv run --group api python scripts/mini_tp1_client.py
+    API_TOKEN=<token> uv run --group api python scripts/mini_tp1_client.py
 
 Expected: the valid call answers 200 with the probability and the model version; the
-invalid one answers 422 naming the bad field; a third call with a wrong key answers 401.
+invalid one answers 422 naming the bad field; a third call with a forged token answers 401.
 Set API_URL to point at another host.
 """
 
@@ -39,7 +40,7 @@ def run(client: httpx.Client) -> list[int]:
     calls = [
         ("valid", VALID, {}),
         ("invalid (age=-5)", INVALID, {}),
-        ("wrong API key", VALID, {"X-API-KEY": "not-a-real-key"}),
+        ("forged token", VALID, {"Authorization": "Bearer not-a-real-token"}),
     ]
     statuses = []
     for name, body, headers in calls:
@@ -51,11 +52,12 @@ def run(client: httpx.Client) -> list[int]:
 
 
 def main() -> int:
-    key = os.environ.get("API_KEY")
-    if not key:
-        print("Set API_KEY to one of the values in the API's API_KEYS.", file=sys.stderr)
+    token = os.environ.get("API_TOKEN")
+    if not token:
+        print("Set API_TOKEN to a token with the predict role.", file=sys.stderr)
         return 2
-    with httpx.Client(base_url=BASE_URL, headers={"X-API-KEY": key}, timeout=10) as client:
+    headers = {"Authorization": f"Bearer {token}"}
+    with httpx.Client(base_url=BASE_URL, headers=headers, timeout=10) as client:
         statuses = run(client)
     print(f"\nstatuses {statuses}, expected {EXPECTED}")
     return 0 if statuses == EXPECTED else 1

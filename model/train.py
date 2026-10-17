@@ -10,13 +10,14 @@ For each candidate family, on the training split only:
    scores up on purpose; after calibration a 0.2 means about a 20% chance.
 3. Choose the threshold: the cut that maximizes F2 on out-of-fold calibrated probabilities,
    so every training row is scored by a model that never saw it.
-4. Log: the run, its hyperparameters, out-of-fold and test metrics, and the model.
+4. Log: the run, its hyperparameters, out-of-fold and test metrics, and the model, whose
+   files are hashed right after the upload (the digest the model server checks later).
 
 The candidate with the best out-of-fold F2 is the finalist. It becomes a new version of the
 served model and goes through the gate (stroke.registry.run_gate), which promotes it only
-with statistical evidence that it beats the champion. The test split picks nothing: not
-the hyperparameters, not the threshold, not the finalist. It is scored once per candidate
-for the record, and the gate reads it.
+with statistical evidence that it beats the champion, and every version gets a model card.
+The test split picks nothing: not the hyperparameters, not the threshold, not the finalist.
+It is scored once per candidate for the record, and the gate reads it.
 """
 
 import argparse
@@ -50,6 +51,7 @@ from stroke.config import (
 from stroke.data import TrainingData, assign_hospital, frozen_data
 from stroke.drift import reference_document
 from stroke.evaluation import PRIMARY, best_threshold, metrics_at
+from stroke.model_card import log_model_card
 from stroke.registry import get_alias, log_candidate, register, run_gate, use_experiment
 
 log = logging.getLogger(__name__)
@@ -201,7 +203,7 @@ def train_candidate(
     test_metrics = metrics_at(data.y_test, model.predict_proba(data.X_test)[:, 1], threshold)
 
     use_experiment()
-    run_id, model_uri = log_candidate(
+    logged = log_candidate(
         name,
         single_threaded(model),
         params,
@@ -222,8 +224,9 @@ def train_candidate(
     )
     summary = {
         "model_family": name,
-        "run_id": run_id,
-        "model_uri": model_uri,
+        "run_id": logged.run_id,
+        "model_uri": logged.model_uri,
+        "artifact_sha256": logged.artifact_sha256,
         "threshold": threshold,
         "data_version": data.data_version,
         "test_split": data.test_split,
@@ -245,11 +248,19 @@ def register_and_gate(
     min_p_better: float = GATE_MIN_P_BETTER,
     name: str = MODEL_NAME,
 ) -> dict:
-    """Register the finalist as a new version, then let the gate decide on it."""
+    """Register the finalist as a new version, let the gate decide on it, then write the
+    version's model card (it records the gate's decision, so it comes last)."""
     finalist = select_finalist(summaries)
     version = register(name, finalist)
     log.info("finalist %s registered as %s v%s", finalist["model_family"], name, version)
-    result = run_gate(MlflowClient(), name, version, data.X_test, data.y_test, min_p_better)
+    client = MlflowClient()
+    result = run_gate(client, name, version, data.X_test, data.y_test, min_p_better)
+    try:
+        log_model_card(client, name, version)
+    except Exception:
+        # The gate has already decided, and promoted if it passed: failing the run here
+        # would read as a failed promotion. The decision is on the version's tags anyway.
+        log.exception("%s v%s: could not write its model card", name, version)
     return {**result, "model_family": finalist["model_family"]}
 
 
