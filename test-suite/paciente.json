@@ -1,0 +1,13 @@
+{
+  "patient_id": "p-demo",
+  "gender": "Male",
+  "age": 67,
+  "hypertension": 0,
+  "heart_disease": 1,
+  "ever_married": "Yes",
+  "work_type": "Private",
+  "residence_type": "Urban",
+  "avg_glucose_level": 228.69,
+  "bmi": 36.6,
+  "smoking_status": "formerly smoked"
+}
